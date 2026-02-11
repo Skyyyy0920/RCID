@@ -1,0 +1,56 @@
+# Experiment 3: Multi-task Causal Imprint Analysis (Section 4.3)
+# Extracts imprints for IOI and Greater-Than independently,
+# analyzes cross-task overlap, then compares distillation strategies.
+
+experiment:
+  name: "exp3_multitask"
+  output_dir: "outputs/results/exp3"
+  seeds: [42, 123, 456]
+
+teacher:
+  name: "gpt2"
+  n_layers: 12
+  d_model: 768
+
+student:
+  n_layers: 4
+  d_model: 384
+  n_head: 6
+
+data:
+  ioi:
+    n_train_pairs: 400
+    n_val_pairs: 100
+    batch_size: 32
+  greater_than:
+    n_train_pairs: 400
+    n_val_pairs: 100
+    batch_size: 32
+
+circuit:
+  top_k_checkpoints: 5
+
+alignment:
+  calibration_size: 200
+
+training:
+  epochs: 20
+  lr: 5.0e-5
+  max_grad_norm: 1.0
+  lambda_rcid: 1.0
+  lambda_kl: 1.0
+  temperature: 4.0
+  save_dir: "outputs/checkpoints/exp3"
+
+strategies:
+  - name: "IOI-only-RCID"
+    task_source: "ioi"
+  - name: "GT-only-RCID"
+    task_source: "greater_than"
+  - name: "Multi-task-RCID"
+    task_source: "both"
+  - name: "StandardKD"
+    task_source: null
+
+eval:
+  perplexity_max_samples: 10000

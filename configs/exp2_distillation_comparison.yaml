@@ -1,0 +1,52 @@
+# Experiment 2: Distillation Method Comparison (Section 4.2)
+# Compares RCID vs StandardKD vs FitNets vs PrakashCKA
+# across 3 seeds with identical architecture and data.
+
+experiment:
+  name: "exp2_distillation_comparison"
+  output_dir: "outputs/results/exp2"
+  seeds: [42, 123, 456]
+
+teacher:
+  name: "gpt2"
+  n_layers: 12
+  d_model: 768
+
+student:
+  n_layers: 4
+  d_model: 384
+  n_head: 6
+
+data:
+  task: "ioi"
+  n_train_pairs: 400
+  n_val_pairs: 100
+  batch_size: 32
+
+circuit:
+  top_k_checkpoints: 5
+
+alignment:
+  calibration_size: 200
+
+training:
+  epochs: 20
+  lr: 5.0e-5
+  max_grad_norm: 1.0
+  lambda_rcid: 1.0
+  lambda_kl: 1.0
+  temperature: 4.0
+  save_dir: "outputs/checkpoints/exp2"
+
+methods:
+  - name: "StandardKD"
+    aux_loss: null
+  - name: "FitNets"
+    aux_loss: "fitnets"
+  - name: "PrakashCKA"
+    aux_loss: "prakash_cka"
+  - name: "RCID"
+    aux_loss: "rcid"
+
+eval:
+  perplexity_max_samples: 10000
