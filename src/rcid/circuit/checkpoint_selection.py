@@ -110,76 +110,41 @@ def select_checkpoints(
     return selected
 
 
-def collect_key_positions_ioi(
+def _collect_positions(
     batch: dict[str, torch.Tensor],
+    keys: list[str],
 ) -> list[int]:
-    """从 IOI batch 中收集关键 token 位置。
+    """从 batch 中收集关键 token 位置（通用实现）。
 
-    收集三种关键位置（去重）：
-    - io_token_pos: indirect object 位置
-    - s2_token_pos: subject 第二次出现位置
-    - 末尾位置 (seq_len - 1): 模型最终预测位置
+    收集指定 batch keys 中的所有位置值，再加上每个样本的末尾位置（去重）。
 
     Args:
-        batch: IOI DataLoader 产生的 batch 字典，包含
-               clean_ids (B, seq_len), io_token_pos (B,), s2_token_pos (B,).
+        batch: DataLoader 产生的 batch 字典，必须包含 clean_ids (B, seq_len).
+        keys: 要收集位置的 batch key 名列表（如 ["io_token_pos", "s2_token_pos"]）。
 
     Returns:
-        去重后的关键位置列表。
+        去重后的关键位置列表（升序）。
     """
     positions: set[int] = set()
-
-    # IO 位置
-    for pos in batch["io_token_pos"].tolist():
-        positions.add(int(pos))
-
-    # S2 位置
-    for pos in batch["s2_token_pos"].tolist():
-        positions.add(int(pos))
-
-    # 末尾位置：找到每个样本的实际长度（非 pad 部分）
-    clean_ids = batch["clean_ids"]  # (B, seq_len)
-    for i in range(clean_ids.shape[0]):
-        # 找最后一个非零 token 的位置
-        nonzero_mask = clean_ids[i] != 0  # (seq_len,)
-        if nonzero_mask.any():
-            last_pos = int(nonzero_mask.nonzero()[-1].item())
-            positions.add(last_pos)
-
-    return sorted(positions)
-
-
-def collect_key_positions_greater_than(
-    batch: dict[str, torch.Tensor],
-) -> list[int]:
-    """从 Greater-Than batch 中收集关键 token 位置。
-
-    收集两种关键位置（去重）：
-    - year_token_pos: 起始年份后两位所在位置
-    - 末尾位置 (seq_len - 1): 模型最终预测位置
-
-    Args:
-        batch: Greater-Than DataLoader 产生的 batch 字典，
-               包含 clean_ids (B, seq_len), year_token_pos (B,).
-
-    Returns:
-        去重后的关键位置列表。
-    """
-    positions: set[int] = set()
-
-    # 年份位置
-    for pos in batch["year_token_pos"].tolist():
-        positions.add(int(pos))
-
-    # 末尾位置
+    for k in keys:
+        for pos in batch[k].tolist():
+            positions.add(int(pos))
     clean_ids = batch["clean_ids"]  # (B, seq_len)
     for i in range(clean_ids.shape[0]):
         nonzero_mask = clean_ids[i] != 0  # (seq_len,)
         if nonzero_mask.any():
-            last_pos = int(nonzero_mask.nonzero()[-1].item())
-            positions.add(last_pos)
-
+            positions.add(int(nonzero_mask.nonzero()[-1].item()))
     return sorted(positions)
+
+
+def collect_key_positions_ioi(batch: dict[str, torch.Tensor]) -> list[int]:
+    """从 IOI batch 中收集 io_token_pos, s2_token_pos, 末尾位置。"""
+    return _collect_positions(batch, ["io_token_pos", "s2_token_pos"])
+
+
+def collect_key_positions_greater_than(batch: dict[str, torch.Tensor]) -> list[int]:
+    """从 Greater-Than batch 中收集 year_token_pos, 末尾位置。"""
+    return _collect_positions(batch, ["year_token_pos"])
 
 
 def checkpoints_to_tuples(
@@ -211,27 +176,28 @@ def _log_selection_summary(
     if not selected:
         logger.warning("No checkpoints selected.")
         return
-
-    logger.info("=" * 60)
-    logger.info("Checkpoint Selection Summary")
-    logger.info("=" * 60)
+    sep = "=" * 60
+    logger.info("%s\nCheckpoint Selection Summary\n%s", sep, sep)
     logger.info("Searched: %d layers x %d positions", n_layers, len(searched_positions))
-    logger.info("Selected top-%d checkpoints:", len(selected))
-    logger.info("-" * 60)
-    logger.info("%-6s %-10s %-12s %-12s", "Rank", "Layer", "Token Pos", "Mean Norm")
-    logger.info("-" * 60)
-
+    logger.info("Selected top-%d:", len(selected))
     for rank, r in enumerate(selected, 1):
-        logger.info(
-            "%-6d %-10d %-12d %-12.4f (±%.4f)",
-            rank, r.layer, r.token_pos, r.mean_norm, r.std_norm,
-        )
+        logger.info("  #%d  L%-3d P%-4d  norm=%.4f (±%.4f)",
+                     rank, r.layer, r.token_pos, r.mean_norm, r.std_norm)
+    logger.info("Layers: %s  Positions: %s",
+                sorted(set(r.layer for r in selected)),
+                sorted(set(r.token_pos for r in selected)))
 
-    logger.info("-" * 60)
 
-    # 汇总被选中的层和位置
-    selected_layers = sorted(set(r.layer for r in selected))
-    selected_positions = sorted(set(r.token_pos for r in selected))
-    logger.info("Layers involved:    %s", selected_layers)
-    logger.info("Positions involved: %s", selected_positions)
-    logger.info("=" * 60)
+def collect_key_positions_induction(batch: dict[str, torch.Tensor]) -> list[int]:
+    """从 Induction batch 中收集 trigger_pos, target_pos, 末尾位置。"""
+    return _collect_positions(batch, ["trigger_pos", "target_pos"])
+
+
+def collect_key_positions_sva(batch: dict[str, torch.Tensor]) -> list[int]:
+    """从 SVA batch 中收集 subject_pos, verb_pos, 末尾位置。"""
+    return _collect_positions(batch, ["subject_pos", "verb_pos"])
+
+
+def collect_key_positions_docstring(batch: dict[str, torch.Tensor]) -> list[int]:
+    """从 Docstring batch 中收集 param_name_pos, target_pos, 末尾位置。"""
+    return _collect_positions(batch, ["param_name_pos", "target_pos"])

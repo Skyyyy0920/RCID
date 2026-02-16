@@ -153,7 +153,7 @@ class TestTaskAccuracyIOI:
         loader = _SingleBatchLoader(batch)
 
         with pytest.raises(AssertionError, match="Unknown task"):
-            evaluate(model, loader, task="invalid_task")
+            evaluate(model, loader, task="nonexistent_task")
 
 
 class TestTaskAccuracyGT:

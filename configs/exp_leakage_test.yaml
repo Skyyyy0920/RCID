@@ -1,0 +1,98 @@
+# Information Leakage Test (Section 4.x — Supplementary)
+#
+# 验证 RCID 因果痕迹是否比 FitNets 的 hidden states 更具任务选择性:
+#   - 线性探针分类: task_label 准确率 >> 50%（信息保留）
+#   - 控制标签准确率 ≈ 50%（无无关信息泄漏）
+#   - selectivity = task_acc - mean(control_acc) 越高越好
+#
+# 对比:
+#   RCID 痕迹 d^T = h^T_clean - h^T_corrupt (差值，聚焦因果效应)
+#   FitNets 表示 h^T_clean (完整残差流，可能含无关信息)
+#
+# 预期结果:
+#   RCID: 高 task selectivity, 低控制准确率
+#   FitNets: 较低 selectivity, 控制准确率可能偏高
+
+experiment:
+  name: "exp_leakage_test"
+  output_dir: "outputs/results/leakage"
+  seed: 42
+
+# ── 模型 ─────────────────────────────────────────────────────
+teacher:
+  name: "gpt2"
+  n_layers: 12
+  d_model: 768
+
+# ── 逐任务配置 ───────────────────────────────────────────────
+# 每个任务独立运行，提取表示后做 linear probe
+tasks:
+  - name: "ioi"
+    n_samples: 500
+    # 任务标签: answer_token_id 的二值化（中位数分割）
+    task_label: "answer_token_id"
+    # 控制标签
+    controls:
+      - "even_length"          # clean 序列 token 数是否为偶数
+      - "first_token_even"     # 首 token id 是否为偶数
+      - "random"               # 随机标签（基线）
+
+  - name: "greater_than"
+    n_samples: 500
+    task_label: "year_above_threshold"
+    controls:
+      - "even_length"
+      - "first_token_even"
+      - "random"
+
+  - name: "induction"
+    n_samples: 500
+    task_label: "answer_token_id"
+    controls:
+      - "even_length"
+      - "first_token_even"
+      - "random"
+
+  - name: "sva"
+    n_samples: 500
+    task_label: "singular_vs_plural"
+    controls:
+      - "even_length"
+      - "first_token_even"
+      - "random"
+
+  - name: "docstring"
+    n_samples: 500
+    task_label: "answer_token_id"
+    controls:
+      - "even_length"
+      - "first_token_even"
+      - "random"
+
+# ── 对比的表示类型 ────────────────────────────────────────────
+representations:
+  - name: "rcid_imprint"
+    description: "RCID causal imprint: d = h_clean - h_corrupt at checkpoint"
+    source: "causal_imprint"   # 差值
+
+  - name: "fitnets_hidden"
+    description: "FitNets hidden state: h_clean at matched layer"
+    source: "clean_residual"   # 完整残差流
+
+# ── 回路分析（用于确定检查点位置）────────────────────────────
+circuit:
+  top_k_checkpoints: 5
+
+# ── Linear Probe 超参数 ──────────────────────────────────────
+probe:
+  test_ratio: 0.2
+  n_epochs: 200
+  lr: 0.01
+  seed: 42
+
+# ── 输出 ─────────────────────────────────────────────────────
+# 输出文件:
+#   outputs/results/leakage/leakage_results.json
+#     {task: {representation: {task_probe_accuracy, control_accuracies, selectivity}}}
+#   outputs/results/leakage/leakage_comparison.png
+#     Bar chart: selectivity 对比 (RCID vs FitNets per task)

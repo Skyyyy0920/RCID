@@ -56,8 +56,10 @@ TEMPLATES: list[dict[str, str]] = [
     },
 ]
 
-# 世纪前缀：确保结束年份的世纪部分与起始年份相同
-CENTURY_PREFIXES: list[int] = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+# 世纪前缀：仅使用 "安全" 世纪——所有后两位 01-98 在 GPT-2 中
+# tokenize 为相同 token 数。排除 10/12/14/18（部分年份被 BPE 合并
+# 为单 token，导致 clean/corrupt 长度不一致）。
+CENTURY_PREFIXES: list[int] = [11, 13, 15, 16, 17]
 
 
 @dataclass

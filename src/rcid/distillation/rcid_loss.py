@@ -121,18 +121,25 @@ class RCIDLoss(nn.Module):
             f"vs corrupt {corrupt_input.shape}"
         )
 
+        seq_len = clean_input.shape[1]
+
+        # 过滤越界检查点（variable-length 任务的短 batch 可能不含最长序列）
+        active_cps = [
+            (l, t) for l, t in self.checkpoints if t < seq_len
+        ]
+        if not active_cps:
+            return torch.tensor(0.0, device=clean_input.device, requires_grad=True)
+
         # 验证所有需要的教师痕迹都已提供
-        for l, t in self.checkpoints:
+        for l, t in active_cps:
             assert (l, t) in teacher_imprints, (
                 f"Missing teacher imprint for checkpoint ({l}, {t})"
             )
 
         # ── 提取学生残差流（两次前向，保留梯度）──────────────────────
-        # clean 前向
         student_residuals_clean = self._extract_student_residuals(
             student_model, clean_input,
         )
-        # corrupt 前向
         student_residuals_corrupt = self._extract_student_residuals(
             student_model, corrupt_input,
         )
@@ -142,7 +149,7 @@ class RCIDLoss(nn.Module):
             0.0, device=clean_input.device, dtype=torch.float32,
         )
 
-        for l_t, t_pos in self.checkpoints:
+        for l_t, t_pos in active_cps:
             l_s = self.layer_mapping[l_t]
 
             # 教师痕迹（预计算，无梯度）
@@ -167,15 +174,14 @@ class RCIDLoss(nn.Module):
             ).clamp(min=self.eps)  # (B, d_T)
 
             # 每个检查点的损失: ||normalize(aligned) - normalize(teacher)||²
-            # 先对特征维求和，再对 batch 求平均
             checkpoint_loss = (
                 (d_T_norm - d_S_norm).pow(2).sum(dim=-1).mean()
             )  # scalar
 
             total_loss = total_loss + checkpoint_loss
 
-        # 对检查点数取平均
-        loss = total_loss / len(self.checkpoints)
+        # 对活跃检查点数取平均
+        loss = total_loss / len(active_cps)
 
         # 数值安全检查
         assert loss.isfinite(), f"RCID loss is {loss.item()}"

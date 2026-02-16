@@ -1,4 +1,4 @@
-"""蒸馏训练循环：支持 RCID / StandardKD / FitNets / PrakashCKA 统一接口。"""
+"""蒸馏训练循环：支持 7 种方法的统一接口。"""
 
 from __future__ import annotations
 
@@ -13,15 +13,18 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from rcid.distillation.baselines import StandardKDLoss
-
 logger = logging.getLogger(__name__)
+
+VALID_METHODS = [
+    "standard_kd", "fitnets", "prakash_cka",
+    "tinybert", "minilm", "informed_fitnets", "rcid",
+]
 
 
 @dataclass
 class TrainConfig:
-    """训练超参数（对应 configs/base.yaml 的 training 字段）。"""
-
+    """训练超参数。"""
+    method_name: str = "rcid"
     epochs: int = 20
     batch_size: int = 32
     lr: float = 5e-5
@@ -38,7 +41,6 @@ class TrainConfig:
 @dataclass
 class TrainState:
     """训练状态追踪。"""
-
     epoch: int = 0
     global_step: int = 0
     best_val_loss: float = float("inf")
@@ -47,58 +49,47 @@ class TrainState:
 
 
 class DistillationTrainer:
-    """统一蒸馏训练器。"""
+    """统一蒸馏训练器，支持 7 种方法。"""
 
     def __init__(
         self,
         teacher_model: nn.Module,
         student_model: nn.Module,
         config: TrainConfig,
-        kd_loss_fn: StandardKDLoss | None = None,
-        aux_loss_fn: nn.Module | None = None,
+        loss_fn: nn.Module,
         teacher_imprints: dict[tuple[int, int], torch.Tensor] | None = None,
         device: str | None = None,
     ) -> None:
+        assert config.method_name in VALID_METHODS, (
+            f"Unknown method: {config.method_name!r}, valid: {VALID_METHODS}"
+        )
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.config = config
+        self.method = config.method_name
 
-        # 教师: eval + frozen
         self.teacher = teacher_model
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
 
-        # 学生: train mode
         self.student = student_model
         self.student.to(self.device)
         self.student.train()
 
-        self.kd_loss_fn = kd_loss_fn
-        self.aux_loss_fn = aux_loss_fn
-        if aux_loss_fn is not None:
-            self.aux_loss_fn.to(self.device)
-        self.teacher_imprints = teacher_imprints
-        if teacher_imprints is not None:
-            self.teacher_imprints = {
-                k: v.to(self.device) for k, v in teacher_imprints.items()
-            }
-
-        # 优化器：学生参数 + 辅助损失的可学习参数（如 FitNets 投影）
+        self.loss_fn = loss_fn
+        self.loss_fn.to(self.device)
+        # 优化器: 学生参数 + loss_fn 可学习参数（TinyBERT/FitNets 投影）
         params = list(self.student.parameters())
-        if aux_loss_fn is not None:
-            params += list(aux_loss_fn.parameters())
+        lp = list(self.loss_fn.parameters())
+        if lp:
+            params += lp
+            logger.info("Added %d loss_fn params to optimizer", len(lp))
         self.optimizer = AdamW(params, lr=config.lr)
-
         self.scaler = torch.amp.GradScaler(enabled=config.use_amp)
         self.state = TrainState()
-        self._aux_type = _detect_aux_type(aux_loss_fn)
-
-        logger.info(
-            "Trainer: device=%s, aux=%s, lr=%.1e",
-            self.device, self._aux_type, config.lr,
-        )
+        logger.info("Trainer: method=%s, device=%s", self.method, self.device)
 
     def train(
         self,
@@ -107,17 +98,13 @@ class DistillationTrainer:
     ) -> TrainState:
         """完整训练循环。"""
         cfg = self.config
-        scheduler = CosineAnnealingLR(
+        sched = CosineAnnealingLR(
             self.optimizer, T_max=cfg.epochs * len(train_loader),
         )
-        if cfg.use_wandb:
-            _try_wandb_init(cfg)
-
         for epoch in range(cfg.epochs):
             self.state.epoch = epoch
-            epoch_loss = self._train_epoch(train_loader, scheduler, epoch)
-            self.state.train_losses.append(epoch_loss)
-
+            avg_loss, avg_parts = self._train_epoch(train_loader, sched, epoch)
+            self.state.train_losses.append(avg_loss)
             val_loss = None
             if val_loader is not None:
                 val_loss = self.evaluate(val_loader)
@@ -125,70 +112,58 @@ class DistillationTrainer:
                 if val_loss < self.state.best_val_loss:
                     self.state.best_val_loss = val_loss
                     self._save_checkpoint("best.pt")
-
             logger.info(
                 "Epoch %d/%d: train=%.4f%s", epoch + 1, cfg.epochs,
-                epoch_loss,
+                avg_loss,
                 f", val={val_loss:.4f}" if val_loss is not None else "",
             )
             if cfg.use_wandb:
-                _try_wandb_log({
-                    "epoch": epoch, "train_loss": epoch_loss,
-                    **({"val_loss": val_loss} if val_loss is not None else {}),
-                })
-
+                _try_wandb_log({"epoch": epoch, "train_loss": avg_loss,
+                                **avg_parts,
+                                **({"val_loss": val_loss} if val_loss else {})})
         self._save_checkpoint("final.pt")
         return self.state
 
     @torch.no_grad()
     def evaluate(self, val_loader: DataLoader) -> float:
-        """在验证集上评估，返回平均损失。"""
+        """验证集平均损失。"""
         self.student.eval()
         total, count = 0.0, 0
         for batch in val_loader:
-            loss = self._compute_batch_loss(batch)
+            loss, _ = self._compute_batch_loss(batch)
             total += loss.item()
             count += 1
         self.student.train()
         return total / max(count, 1)
 
     def _train_epoch(
-        self, loader: DataLoader, scheduler: CosineAnnealingLR, epoch: int,
-    ) -> float:
-        """单 epoch 训练，返回平均损失。"""
+        self, loader: DataLoader, sched: CosineAnnealingLR, epoch: int,
+    ) -> tuple[float, dict[str, float]]:
         self.student.train()
-        total_loss, n_steps = 0.0, 0
+        total_loss, n = 0.0, 0
+        accum: dict[str, float] = {}
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}", leave=False)
         for batch in pbar:
-            loss = self._train_step(batch)
-            total_loss += loss
-            n_steps += 1
+            lv, parts = self._train_step(batch)
+            total_loss += lv
+            for k, v in parts.items():
+                accum[k] = accum.get(k, 0.0) + v
+            n += 1
             self.state.global_step += 1
-            scheduler.step()
-
+            sched.step()
             if self.state.global_step % self.config.log_every == 0:
-                pbar.set_postfix(
-                    loss=f"{loss:.4f}",
-                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                )
-                if self.config.use_wandb:
-                    _try_wandb_log({
-                        "step": self.state.global_step,
-                        "step_loss": loss,
-                        "lr": scheduler.get_last_lr()[0],
-                    })
+                pbar.set_postfix(loss=f"{lv:.4f}",
+                                 lr=f"{sched.get_last_lr()[0]:.2e}")
+        n = max(n, 1)
+        return total_loss / n, {k: v / n for k, v in accum.items()}
 
-        return total_loss / max(n_steps, 1)
-
-    def _train_step(self, batch: dict[str, torch.Tensor]) -> float:
-        """forward -> loss -> backward -> step，返回损失值。"""
+    def _train_step(
+        self, batch: dict[str, torch.Tensor],
+    ) -> tuple[float, dict[str, float]]:
         self.optimizer.zero_grad()
-        amp_ctx = torch.amp.autocast(
-            device_type=self.device.type, enabled=self.config.use_amp,
-        )
-        with amp_ctx:
-            loss = self._compute_batch_loss(batch)
-
+        with torch.amp.autocast(device_type=self.device.type,
+                                enabled=self.config.use_amp):
+            loss, parts = self._compute_batch_loss(batch)
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         nn.utils.clip_grad_norm_(
@@ -196,61 +171,112 @@ class DistillationTrainer:
         )
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        return loss.item()
+        return loss.item(), {k: v.item() for k, v in parts.items()}
 
     def _compute_batch_loss(
         self, batch: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """根据方法类型计算总损失。batch: {clean_ids, corrupt_ids, ...}。"""
-        cfg = self.config
-        clean_ids = batch["clean_ids"].to(self.device)  # (B, seq_len)
-        total_loss = torch.tensor(0.0, device=self.device)
-        # KL 损失
-        if self.kd_loss_fn is not None and cfg.lambda_kl > 0:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """返回 (total_loss, {部分损失名: detached 值})。"""
+        clean = batch["clean_ids"].to(self.device)  # (B, S)
+        m = self.method
+
+        # TinyBERT / MiniLM: 自包含（KL+aux 都在 loss_fn 内）
+        if m in ("tinybert", "minilm"):
+            r = self.loss_fn(self.teacher, self.student, clean)
+            return r["loss"], {k: v for k, v in r.items() if k != "loss"}
+
+        # standard_kd: 仅 KL
+        if m == "standard_kd":
             with torch.no_grad():
-                t_logits = self.teacher(clean_ids).logits   # (B, S, V)
-            s_logits = self.student(clean_ids).logits        # (B, S, V)
-            kl_loss = self.kd_loss_fn(t_logits, s_logits)
-            total_loss = total_loss + cfg.lambda_kl * kl_loss
-        # 辅助损失
-        if self.aux_loss_fn is not None and self._aux_type != "none":
-            aux = self._compute_aux_loss(batch, clean_ids)
-            w = cfg.lambda_rcid if self._aux_type == "rcid" else 1.0
-            total_loss = total_loss + w * aux
+                tl = self.teacher(clean).logits     # (B, S, V)
+            sl = self.student(clean).logits          # (B, S, V)
+            kl = self.loss_fn(tl, sl)
+            return kl, {"kl_loss": kl.detach()}
 
-        return total_loss
+        # fitnets, prakash_cka, rcid, informed_fitnets
+        parts: dict[str, torch.Tensor] = {}
+        total = torch.tensor(0.0, device=self.device)
 
-    def _compute_aux_loss(
-        self, batch: dict[str, torch.Tensor], clean_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """分派辅助损失计算。"""
-        if self._aux_type == "rcid":
-            corrupt_ids = batch["corrupt_ids"].to(self.device)
-            return self.aux_loss_fn(
-                self.teacher_imprints, self.student, clean_ids, corrupt_ids,
+        if self.config.lambda_kl > 0:
+            kl = self._kl_loss(clean)
+            total = total + self.config.lambda_kl * kl
+            parts["kl_loss"] = kl.detach()
+
+        aux, w = self._dispatch_aux(batch, clean, m)
+        total = total + w * aux
+        parts["aux_loss"] = aux.detach()
+        return total, parts
+
+    def _dispatch_aux(
+        self, batch: dict[str, torch.Tensor],
+        clean: torch.Tensor, method: str,
+    ) -> tuple[torch.Tensor, float]:
+        """分派辅助损失。返回 (loss, weight)。"""
+        if method == "rcid":
+            corrupt = batch["corrupt_ids"].to(self.device)
+            imps = self._get_batch_imprints(clean, corrupt)
+            return self.loss_fn(
+                imps, self.student, clean, corrupt,
+            ), self.config.lambda_rcid
+        if method in ("fitnets", "prakash_cka"):
+            t_res = self._get_teacher_residuals(
+                clean, self.loss_fn._teacher_layers,
             )
-        # FitNets / PrakashCKA: 需要教师残差流（每 batch 计算）
-        teacher_layers = self.aux_loss_fn._teacher_layers
-        teacher_res = self._get_teacher_residuals(clean_ids, teacher_layers)
-        return self.aux_loss_fn(teacher_res, self.student, clean_ids)
+            return self.loss_fn(t_res, self.student, clean), 1.0
+        if method == "informed_fitnets":
+            imps = self._get_batch_imprints(clean)
+            return self.loss_fn(
+                imps, self.student, clean,
+            ), self.config.lambda_rcid
+        return torch.tensor(0.0, device=self.device), 0.0
+
+    @torch.no_grad()
+    def _get_batch_imprints(
+        self, clean: torch.Tensor, corrupt: torch.Tensor | None = None,
+    ) -> dict[tuple[int, int], torch.Tensor]:
+        """在线计算教师痕迹，自动跳过越界位置（短 batch）。"""
+        cps = self.loss_fn.checkpoints
+        layers = sorted(set(l for l, _ in cps))
+        rc = self._get_teacher_residuals(clean, layers)
+        seq_len = rc[layers[0]].shape[1]  # 当前 batch 实际 seq_len
+        out: dict[tuple[int, int], torch.Tensor] = {}
+        if corrupt is not None:
+            rp = self._get_teacher_residuals(corrupt, layers)
+            for l, t in cps:
+                if t >= seq_len:
+                    continue
+                out[(l, t)] = rc[l][:, t, :] - rp[l][:, t, :]  # (B, d_T)
+        else:
+            for l, t in cps:
+                if t >= seq_len:
+                    continue
+                out[(l, t)] = rc[l][:, t, :]  # (B, d_T)
+        return out
+
+    def _kl_loss(self, clean_ids: torch.Tensor) -> torch.Tensor:
+        """通用 KL 损失。"""
+        with torch.no_grad():
+            tl = self.teacher(clean_ids).logits            # (B, S, V)
+        sl = self.student(clean_ids).logits                 # (B, S, V)
+        tau = 4.0
+        tp = torch.softmax(tl / tau, dim=-1)               # (B, S, V)
+        slp = torch.log_softmax(sl / tau, dim=-1)          # (B, S, V)
+        return nn.functional.kl_div(slp, tp, reduction="batchmean") * tau**2
 
     @torch.no_grad()
     def _get_teacher_residuals(
         self, input_ids: torch.Tensor, layers: list[int],
     ) -> dict[int, torch.Tensor]:
-        """提取教师残差流（no_grad, detached）。"""
         residuals: dict[int, torch.Tensor] = {}
         handles = []
         for layer in layers:
-            def _make_hook(l: int):  # noqa: E741
+            def _mh(l: int):  # noqa: E741
                 def hook(mod, inp, out):
                     residuals[l] = out[0].detach()
                 return hook
-            handle = self.teacher.transformer.h[layer].register_forward_hook(
-                _make_hook(layer),
+            handles.append(
+                self.teacher.transformer.h[layer].register_forward_hook(_mh(layer))
             )
-            handles.append(handle)
-
         try:
             self.teacher(input_ids)
         finally:
@@ -258,38 +284,11 @@ class DistillationTrainer:
                 h.remove()
         return residuals
 
-    def _save_checkpoint(self, filename: str) -> None:
-        """保存学生模型 checkpoint。"""
-        save_dir = Path(self.config.save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        path = save_dir / filename
-        torch.save({
-            "student_state_dict": self.student.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "state": self.state,
-        }, path)
-        logger.info("Saved checkpoint: %s", path)
-
-
-def _detect_aux_type(loss_fn: nn.Module | None) -> str:
-    """检测辅助损失类型。"""
-    if loss_fn is None:
-        return "none"
-    name = type(loss_fn).__name__
-    if "RCID" in name:
-        return "rcid"
-    if "FitNet" in name:
-        return "fitnets"
-    if "Prakash" in name or "CKA" in name:
-        return "prakash"
-    return "unknown"
-
-
-def _try_wandb_init(cfg: TrainConfig) -> None:
-    try:
-        import wandb; wandb.init(project="rcid", config=vars(cfg))
-    except Exception as e:
-        logger.warning("wandb init failed: %s", e)
+    def _save_checkpoint(self, name: str) -> None:
+        d = Path(self.config.save_dir); d.mkdir(parents=True, exist_ok=True)
+        torch.save({"student_state_dict": self.student.state_dict(),
+                     "optimizer_state_dict": self.optimizer.state_dict(),
+                     "state": self.state}, d / name)
 
 
 def _try_wandb_log(data: dict) -> None:

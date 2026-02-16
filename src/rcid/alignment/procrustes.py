@@ -96,14 +96,13 @@ def procrustes_align(
         U, S, Vh = torch.linalg.svd(M_reg, full_matrices=False)
 
     # ── 构造对齐矩阵 ─────────────────────────────────────────────────
-    W = U @ Vh  # (d_T, d_S)
+    W = U @ Vh  # (d_T, d_S) — 始终正交（W = U @ Vh 的固有性质）
 
     assert W.shape == (d_t, d_s), (
         f"W shape {W.shape} != expected ({d_t}, {d_s})"
     )
 
     # ── 正交性验证 ────────────────────────────────────────────────────
-    # W^T W 应近似为 I_{d_S}（列正交），无论 d_T 和 d_S 的关系
     WtW = W.T @ W  # (d_S, d_S)
     I_ds = torch.eye(d_s, device=W.device, dtype=W.dtype)  # (d_S, d_S)
     orthogonality_error = (WtW - I_ds).norm().item()
@@ -120,11 +119,18 @@ def procrustes_align(
             d_t, d_s, orthogonality_error,
         )
 
-    # 日志输出奇异值分布（帮助诊断对齐质量）
+    # 日志输出奇异值分布和条件数（诊断对齐质量）
+    cond = S.max() / S.min().clamp(min=1e-12)
     logger.info(
-        "Singular values: min=%.4f, max=%.4f, mean=%.4f",
-        S.min().item(), S.max().item(), S.mean().item(),
+        "Singular values: min=%.4f, max=%.4f, mean=%.4f, cond=%.2e",
+        S.min().item(), S.max().item(), S.mean().item(), cond.item(),
     )
+    if cond > 1e6:
+        logger.warning(
+            "High condition number (%.2e) — alignment signal is weak in some "
+            "directions. RCID loss may converge slowly on this task.",
+            cond.item(),
+        )
 
     return W
 
