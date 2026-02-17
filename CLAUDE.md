@@ -1,651 +1,636 @@
-# RCID Project — Claude Code 编码指南
+# RCID Project — CLAUDE.md
 
 > **项目名称**: RCID (Residual Causal Imprint Distillation)
-> **论文标题**: Beyond Component Mapping: Distilling Circuit Knowledge via Residual Stream Causal Imprints
-> **目标会议**: NeurIPS 2026
+> **论文定位**: 提出因果一致性指标揭示蒸馏中的机制保留问题，并提出 RCID 方法实现更好的蒸馏
+> **核心问题**: 蒸馏后的 student 内部推理机制是否与 teacher 一致？如何让它一致？
+> **目标会议**: ICLR 2027 / NeurIPS 2026
 
 ---
 
-## 一、项目结构规范
+## 一、论文的两条主线
+
+### 主线 A：发现问题
+
+现有蒸馏方法（StandardKD、FitNets 等）产出的 student 即使任务准确率接近 teacher，
+其内部推理机制可能完全不同。我们提出**因果一致性**指标来量化这个现象。
+
+### 主线 B：解决问题
+
+我们提出 RCID，一种因果引导的蒸馏方法。通过在因果关键位置匹配 teacher 和 student
+的因果差值（而非原始表示），RCID 在任务准确率、因果一致性、OOD 鲁棒性上均优于现有方法。
+
+两条线缺一不可：没有主线 A，RCID 只是"又一个蒸馏方法"；没有主线 B，论文只有诊断没有解药。
+
+---
+
+## 二、核心概念
+
+### 2.1 两种残差流操作
+
+**Read（提取因果痕迹）**：读取残差流值，不改变模型行为。用于检查点搜索和蒸馏训练。
+```python
+h_clean = hook_read(model, clean_input, layer, pos)
+h_corrupt = hook_read(model, corrupt_input, layer, pos)
+d = h_clean - h_corrupt  # 因果痕迹
+```
+
+**Write（因果干预 / activation patching）**：替换残差流值并继续前向传播。用于因果一致性评估。
+```python
+logits_patched = patch_and_run(model, clean_input, corrupt_value, layer, pos)
+delta = logit_diff(original) - logit_diff(patched)  # 因果效应
+```
+
+Read 回答"这个位置在 clean/corrupt 之间差多少"；
+Write 回答"这个位置对模型输出有多大因果影响"。
+
+### 2.2 因果一致性指标
+
+对 teacher 和 student 施加相同的因果干预（Write），比较行为变化：
+
+$$\text{CausalConsistency} = \text{Pearson}(\Delta_T, \Delta_S)$$
+
+- $\Delta_T$：对 teacher 在检查点做 patching 后的输出变化
+- $\Delta_S$：对 student 在对应位置做同样 patching 后的输出变化
+- student 的 patching 值来自 student 自身的 corrupt 前向传播（不是 teacher 的）
+
+### 2.3 RCID 损失
+
+$$\mathcal{L} = \mathcal{L}_{\text{KL}} + \lambda \cdot \frac{1}{|\mathcal{C}|} \sum_{(l,t) \in \mathcal{C}} \left\| \frac{W^* d_{\hat{l},t}^{S}}{\|W^* d_{\hat{l},t}^{S}\|} - \frac{d_{l,t}^{T}}{\|d_{l,t}^{T}\|} \right\|^2$$
+
+其中 $d = h_{\text{clean}} - h_{\text{corrupt}}$ 是因果差值，$W^*$ 是冻结的 Procrustes 对齐矩阵。
+
+### 2.4 因果检查点选择
+
+搜索 teacher 内部所有 (层, token位置) 组合，按残差流差值范数排序选 top-k。
+
+**关键约束——区分两类位置**：
+
+- **被修改位置**：clean 和 corrupt 在该位置放了不同 token（如 IOI 的 S2 位置）。
+  底层差异是 trivial 的（embedding 不同），只有高层差异反映模型的加工。
+- **未被修改位置**：clean 和 corrupt 在该位置 token 完全相同（如 IOI 的句末位置）。
+  任何差异都来自模型内部的信息传播，是干净的因果信号。
+
+检查点选择需要多样性约束：确保两类位置都有代表，不要被被修改位置的 trivial 高范数淹没。
+
+---
+
+## 三、项目结构
 
 ```
 rcid/
-├── CLAUDE.md                   # ← 本文件，Claude Code 自动读取
-├── pyproject.toml              # 项目元数据与依赖（用 uv/pip 管理）
-├── configs/                    # 实验配置（YAML）
-│   ├── base.yaml
-│   ├── exp1_imprint_extraction.yaml
-│   ├── exp2_distillation_comparison.yaml
-│   └── exp3_multitask.yaml
+├── CLAUDE.md
+├── pyproject.toml
+├── configs/
+│   ├── master.yaml
+│   ├── exp1_circuit_preservation.yaml
+│   ├── exp2_causal_guidance.yaml
+│   ├── exp3_robustness_correlation.yaml
+│   ├── exp4_component_analysis.yaml
+│   └── exp5_information_purity.yaml
 ├── src/
 │   └── rcid/
 │       ├── __init__.py
-│       ├── circuit/            # 回路分析模块
-│       │   ├── patching.py         # activation patching / path patching
-│       │   ├── contrastive.py      # 对比数据集构建
-│       │   └── checkpoint_selection.py  # 因果检查点选择
-│       ├── alignment/          # 跨模型对齐模块
-│       │   ├── procrustes.py       # Procrustes 对齐 + 冻结 W
-│       │   ├── layer_matching.py   # CKA 层匹配搜索
-│       │   └── cka.py              # CKA 计算
-│       ├── distillation/       # 蒸馏训练模块
-│       │   ├── rcid_loss.py        # L_RCID 损失函数
-│       │   ├── trainer.py          # 训练循环
-│       │   └── baselines.py        # 标准KD / FitNets / Prakash 基线
-│       ├── models/             # 模型定义与加载
+│       ├── circuit/                # 因果分析
+│       │   ├── patching.py             # extract_causal_imprints (Read)
+│       │   ├── intervention.py         # patch_and_run (Write)
+│       │   ├── contrastive.py          # 对比数据集基类
+│       │   ├── checkpoint_selection.py # 因果检查点选择（含多样性约束）
+│       │   └── component_analysis.py   # IOI 电路组件级分析
+│       ├── alignment/
+│       │   ├── procrustes.py
+│       │   ├── layer_matching.py
+│       │   └── cka.py
+│       ├── distillation/
+│       │   ├── rcid_loss.py
+│       │   ├── trainer.py
+│       │   └── baselines.py           # StandardKD, FitNets, InformedFitNets
+│       ├── models/
 │       │   ├── teacher.py
 │       │   └── student.py
-│       ├── data/               # 数据加载
-│       │   ├── ioi.py              # IOI 任务数据
-│       │   ├── greater_than.py     # Greater-than 任务数据
-│       │   └── general.py          # 通用评估数据 (WikiText等)
-│       └── eval/               # 评估模块
-│           ├── task_accuracy.py
-│           ├── causal_consistency.py   # 因果干预一致性
-│           └── perplexity.py
-├── scripts/                    # 入口脚本
-│   ├── extract_imprints.py     # Step 1: 提取因果痕迹
-│   ├── align_spaces.py         # Step 2: Procrustes对齐 + 层匹配
-│   ├── train.py                # Step 3: 蒸馏训练
-│   └── evaluate.py             # Step 4: 评估
-├── tests/                      # 单元测试
-│   ├── test_patching.py
-│   ├── test_procrustes.py
-│   ├── test_cka.py
-│   └── test_rcid_loss.py
-├── notebooks/                  # 分析与可视化（不放核心逻辑）
-│   ├── visualize_imprints.ipynb
-│   └── analyze_results.ipynb
-└── outputs/                    # 实验输出（gitignore）
-    ├── imprints/
-    ├── checkpoints/
-    └── results/
+│       ├── data/
+│       │   ├── ioi.py                  # IOI 任务（主力）
+│       │   ├── greater_than.py         # Greater-Than（泛化验证）
+│       │   └── general.py              # WikiText 等通用数据
+│       ├── eval/
+│       │   ├── causal_consistency.py   # 核心指标
+│       │   ├── task_accuracy.py
+│       │   ├── ood_robustness.py
+│       │   ├── information_purity.py   # 因果差值 vs 原始表示的信息纯度对比
+│       │   └── perplexity.py
+│       └── visualization/
+│           └── paper_figures.py
+├── scripts/
+│   ├── run_exp1_circuit_preservation.py
+│   ├── run_exp2_causal_guidance.py
+│   ├── run_exp3_robustness_correlation.py
+│   ├── run_exp4_component_analysis.py
+│   ├── run_exp5_information_purity.py
+│   ├── run_all_experiments.py
+│   └── pretrain_students.py
+├── tests/
+└── outputs/
 ```
-
-### 关键原则
-
-- `src/rcid/` 下的每个 `.py` 文件不超过 300 行。超过则拆分。
-- `scripts/` 是入口，只做参数解析和调用 `src/rcid/` 中的函数，不含实质逻辑。
-- `configs/` 控制所有超参数，代码中不硬编码任何数值。
-- `tests/` 中的测试**必须**在每次修改核心模块后运行。
 
 ---
 
-## 二、编码规范
+## 四、五个核心实验
 
-### 2.1 类型标注（强制）
+### 实验 1：现有蒸馏方法保留了 teacher 的电路吗？
 
-所有函数签名必须完整标注。这是 NeurIPS 级别代码的基本要求，也帮助 Claude Code 理解意图。
+**最重要的发现性实验（主线 A 的核心证据）。**
+
+```
+步骤：
+1. 在 teacher 上搜索因果检查点（Read）
+2. 用 StandardKD、FitNets、第三种方法各蒸馏一个 student
+3. 对每个 student，在每个检查点做因果干预（Write）：
+   - teacher: ΔT = logit_diff(original) - logit_diff(patched)
+   - student: ΔS = 同上（用 student 自己的 corrupt 值）
+   - causal_consistency = Pearson(ΔT, ΔS)
+
+预期发现：student 任务准确率接近 teacher，但因果一致性很低。
+```
+
+### 实验 2：RCID 能否改善机制传递？
+
+**主线 B 的核心证据——证明 RCID 优于现有方法。**
+
+4 种方法对比，同时评估 task accuracy、causal consistency、perplexity：
+- StandardKD（只看输出）
+- FitNets（所有层匹配完整表示）
+- Informed FitNets（因果位置匹配完整表示）
+- RCID（因果位置匹配因果差值）
+
+同时做因素拆解：
+- FitNets → Informed FitNets 的提升 = "选对位置"的贡献
+- Informed FitNets → RCID 的提升 = "匹配因果差值"的贡献
+
+### 实验 3：电路保留度 vs 行为鲁棒性
+
+收集实验 1、2 中所有 student 的 (causal_consistency, ood_robustness) 数据对。
+如果正相关 → 建立因果链：保留 teacher 推理机制 → 更鲁棒的泛化 → RCID 的鲁棒性优势有因果解释。
+
+### 实验 4：逐组件电路分析
+
+以 IOI 为案例。IOI 电路有 7 类组件（Wang et al., 2023）：
+Duplicate Token Heads、Previous Token Heads、S-Inhibition Heads、
+Name Mover Heads、Backup Name Movers、Induction Heads、Negative Name Movers。
+
+对每种蒸馏方法的 student，用 head-level knockout 检查每类组件是否被保留。
+生成 7 类组件 × 4 种方法 的保留度矩阵。
+
+预期：RCID 的 student 保留了更多组件。
+
+### 实验 5：因果差值的信息纯度
+
+对比两种表示的信息内容：
+- $h^T$（原始残差流，FitNets 匹配的目标）
+- $d^T = h^T_{\text{clean}} - h^T_{\text{corrupt}}$（因果差值，RCID 匹配的目标）
+
+用线性探针分别预测任务标签和控制标签：
+- 任务标签：IO name 属于预定义的 A 组还是 B 组
+- 控制标签：用了哪个句子模板（与因果逻辑无关但存在于输入中）
+
+在**未被修改的 token 位置**做测试（如句末）。
+
+预期：$d^T$ 的 selectivity > $h^T$ 的 selectivity。
+因果差值更"纯净"——只编码任务信息，过滤了通用噪声。
+
+---
+
+## 五、核心模块实现规范
+
+### 5.1 因果干预 (`circuit/intervention.py`)
 
 ```python
-# ✅ 正确
-def extract_causal_imprint(
+def patch_and_run(
     model: nn.Module,
-    clean_input: torch.Tensor,       # shape: (batch, seq_len)
-    corrupt_input: torch.Tensor,     # shape: (batch, seq_len)
+    clean_input: torch.Tensor,       # (batch, seq_len)
+    patch_value: torch.Tensor,       # (batch, d_model)
     layer: int,
     token_pos: int,
-) -> torch.Tensor:                   # shape: (batch, d_model)
-    """提取指定层和token位置的因果痕迹向量。
+) -> torch.Tensor:                   # (batch, vocab_size) — patched logits
+    """在第 layer 层第 token_pos 位置注入 patch_value，继续前向传播。
     
-    因果痕迹定义为: d = r(x_clean) - r(x_corrupt)
-    其中 r 是残差流在指定层和位置的值。
+    Pearl 的 do-operator 在 transformer 中的实现。
     """
-    ...
-
-# ❌ 错误
-def extract(model, x1, x2, l, t):
-    ...
-```
-
-### 2.2 Tensor Shape 注释（强制）
-
-每个 tensor 变量旁必须注释 shape。这是调试的生命线。
-
-```python
-residual_clean = get_residual(model, clean_input, layer, token_pos)  # (B, d_model)
-residual_corrupt = get_residual(model, corrupt_input, layer, token_pos)  # (B, d_model)
-imprint = residual_clean - residual_corrupt  # (B, d_model)
-
-# 归一化
-imprint_norm = imprint / imprint.norm(dim=-1, keepdim=True)  # (B, d_model)
-```
-
-### 2.3 断言检查（关键数学操作处强制）
-
-在所有涉及维度变换、矩阵乘法、损失计算的地方加入 assert：
-
-```python
-def rcid_loss(
-    teacher_imprint: torch.Tensor,  # (B, d_T)
-    student_imprint: torch.Tensor,  # (B, d_S)
-    W: torch.Tensor,                # (d_T, d_S)
-) -> torch.Tensor:
-    assert teacher_imprint.dim() == 2, f"Expected 2D, got {teacher_imprint.dim()}D"
-    assert student_imprint.shape[0] == teacher_imprint.shape[0], "Batch size mismatch"
-    assert W.shape == (teacher_imprint.shape[1], student_imprint.shape[1]), \
-        f"W shape {W.shape} incompatible with d_T={teacher_imprint.shape[1]}, d_S={student_imprint.shape[1]}"
+    def _patch_hook(module, input, output):
+        h = output[0].clone()                    # (batch, seq_len, d_model)
+        h[:, token_pos, :] = patch_value          # 注入
+        return (h,) + output[1:]
     
-    aligned_student = student_imprint @ W.T  # (B, d_T)
-    
-    # 归一化（避免除以零）
-    t_norm = teacher_imprint / (teacher_imprint.norm(dim=-1, keepdim=True) + 1e-8)  # (B, d_T)
-    s_norm = aligned_student / (aligned_student.norm(dim=-1, keepdim=True) + 1e-8)  # (B, d_T)
-    
-    loss = (t_norm - s_norm).pow(2).sum(dim=-1).mean()  # scalar, 等价于 2(1 - cos θ)
-    
-    assert loss.isfinite(), f"RCID loss is {loss.item()}"
-    return loss
-```
-
-### 2.4 Hook 管理（易错重灾区）
-
-activation patching 大量使用 PyTorch hooks。必须严格管理生命周期：
-
-```python
-# ✅ 正确：用 context manager 管理 hooks
-@contextmanager
-def residual_hook(
-    model: nn.Module,
-    layer: int,
-    storage: dict[str, torch.Tensor],
-):
-    """临时注册 hook 提取指定层的残差流输出。"""
-    handle = model.transformer.h[layer].register_forward_hook(
-        lambda module, input, output: storage.update(
-            {"residual": output[0]}  # GPT-2: output[0] 是残差流
-        )
-    )
+    handle = model.transformer.h[layer].register_forward_hook(_patch_hook)
     try:
-        yield storage
+        with torch.no_grad():
+            patched_logits = model(clean_input).logits
     finally:
-        handle.remove()  # 绝对不能泄漏
+        handle.remove()
+    
+    return patched_logits
 
-# 使用
-storage = {}
-with residual_hook(model, layer=6, storage=storage):
-    model(input_ids)
-residual = storage["residual"][:, token_pos, :]  # (B, d_model)
 
-# ❌ 错误：hooks 不 remove 会累积，导致内存泄漏和计算错误
-handle = model.transformer.h[6].register_forward_hook(...)
-model(input_ids)
-# 忘了 handle.remove() → 每次调用都会多一个 hook
-```
-
-### 2.5 数值稳定性
-
-```python
-# 余弦相似度 / 归一化时，始终加 epsilon
-eps = 1e-8
-norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
-x_normalized = x / norm
-
-# Procrustes 对齐的 SVD 可能不收敛
-try:
-    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-except torch.linalg.LinAlgError:
-    logger.warning("SVD did not converge, falling back to regularized version")
-    M_reg = M + 1e-6 * torch.eye(M.shape[0], device=M.device)
-    U, S, Vh = torch.linalg.svd(M_reg, full_matrices=False)
-
-W = U @ Vh  # 正交对齐矩阵
-```
-
----
-
-## 三、核心模块实现指南
-
-### 3.1 因果痕迹提取 (`circuit/patching.py`)
-
-```python
-def extract_imprints_at_checkpoints(
+def compute_causal_effect(
     model: nn.Module,
-    clean_inputs: torch.Tensor,      # (N, seq_len)
-    corrupt_inputs: torch.Tensor,    # (N, seq_len)  
-    checkpoints: list[tuple[int, int]],  # [(layer, token_pos), ...]
-) -> dict[tuple[int, int], torch.Tensor]:  # {(l, t): (N, d_model)}
-    """在所有检查点提取因果痕迹。
+    clean_input: torch.Tensor,       # (batch, seq_len)
+    corrupt_input: torch.Tensor,     # (batch, seq_len)
+    layer: int,
+    token_pos: int,
+    answer_pos: int,
+    correct_token_id: torch.Tensor,  # (batch,)
+    wrong_token_id: torch.Tensor,    # (batch,)
+) -> torch.Tensor:                   # (batch,) 因果效应 Δ
+    """Δ = logit_diff(original) - logit_diff(patched)
     
-    对每个检查点 (l, t):
-        d_{l,t} = residual_l(x_clean)[:, t, :] - residual_l(x_corrupt)[:, t, :]
-    
-    注意：两次前向传播使用完全相同的模型状态。
-    模型始终处于 eval 模式且 no_grad。
+    logit_diff = logit(correct) - logit(wrong)
+    Δ > 0 表示该位置对正确输出有正向因果贡献。
     """
     model.eval()
-    imprints = {}
     
+    # 原始输出
     with torch.no_grad():
-        # 按层分组，减少 hook 注册次数
-        layers_needed = sorted(set(l for l, t in checkpoints))
-        
-        for layer in layers_needed:
-            positions = [t for l, t in checkpoints if l == layer]
-            
-            storage_clean, storage_corrupt = {}, {}
-            with residual_hook(model, layer, storage_clean):
-                model(clean_inputs)
-            with residual_hook(model, layer, storage_corrupt):
-                model(corrupt_inputs)
-            
-            for t in positions:
-                d = storage_clean["residual"][:, t, :] - storage_corrupt["residual"][:, t, :]
-                imprints[(layer, t)] = d  # (N, d_model)
+        orig_logits = model(clean_input).logits[:, answer_pos, :]  # (batch, vocab)
+    orig_diff = (
+        orig_logits.gather(1, correct_token_id.unsqueeze(1))
+        - orig_logits.gather(1, wrong_token_id.unsqueeze(1))
+    ).squeeze(1)  # (batch,)
     
-    return imprints
+    # 获取 corrupt 时该位置的残差流值
+    corrupt_cache = {}
+    handle = model.transformer.h[layer].register_forward_hook(
+        lambda mod, inp, out, s=corrupt_cache: s.update({"h": out[0][:, token_pos, :].clone()})
+    )
+    with torch.no_grad():
+        model(corrupt_input)
+    handle.remove()
+    corrupt_value = corrupt_cache["h"]  # (batch, d_model)
+    
+    # Patched 输出
+    patched_logits = patch_and_run(model, clean_input, corrupt_value, layer, token_pos)
+    patched_logits = patched_logits[:, answer_pos, :]  # (batch, vocab)
+    patched_diff = (
+        patched_logits.gather(1, correct_token_id.unsqueeze(1))
+        - patched_logits.gather(1, wrong_token_id.unsqueeze(1))
+    ).squeeze(1)  # (batch,)
+    
+    return orig_diff - patched_diff  # (batch,)
 ```
 
-**测试要求**：
-- 在 GPT-2 上验证：对 IOI 任务，Name Mover heads 所在层的痕迹范数应该最大
-- Sanity check：clean == corrupt 时，所有痕迹应为零向量
+### 5.2 因果一致性评估 (`eval/causal_consistency.py`)
 
-### 3.2 Procrustes 对齐 (`alignment/procrustes.py`)
+```python
+class CausalConsistencyEvaluator:
+    """对 teacher 和 student 施加相同因果干预，比较行为变化的相关性。"""
+    
+    def evaluate(
+        self,
+        teacher: nn.Module,
+        student: nn.Module,
+        dataset: ContrastiveDataset,
+        checkpoints: list[tuple[int, int]],
+        layer_mapping: dict[int, int],
+    ) -> dict:
+        """
+        Returns:
+            per_checkpoint: {(l,t): {"correlation": float, "p_value": float}}
+            mean_correlation: float
+            teacher_deltas: {(l,t): Tensor(n_samples,)}
+            student_deltas: {(l,t): Tensor(n_samples,)}
+        """
+        results = {}
+        for (t_layer, t_pos) in checkpoints:
+            s_layer = layer_mapping[t_layer]
+            
+            delta_T = compute_causal_effect(
+                teacher, dataset.clean_ids, dataset.corrupt_ids,
+                layer=t_layer, token_pos=t_pos,
+                answer_pos=dataset.answer_pos,
+                correct_token_id=dataset.correct_ids,
+                wrong_token_id=dataset.wrong_ids,
+            )
+            delta_S = compute_causal_effect(
+                student, dataset.clean_ids, dataset.corrupt_ids,
+                layer=s_layer, token_pos=t_pos,
+                answer_pos=dataset.answer_pos,
+                correct_token_id=dataset.correct_ids,
+                wrong_token_id=dataset.wrong_ids,
+            )
+            
+            r, p = scipy.stats.pearsonr(delta_T.cpu().numpy(), delta_S.cpu().numpy())
+            results[(t_layer, t_pos)] = {"correlation": r, "p_value": p}
+        
+        mean_corr = np.mean([v["correlation"] for v in results.values()])
+        return {"per_checkpoint": results, "mean_correlation": mean_corr}
+```
+
+### 5.3 Procrustes 对齐 (`alignment/procrustes.py`)
 
 ```python
 def procrustes_align(
-    source: torch.Tensor,   # (N, d_S) — 学生侧的对比差值
-    target: torch.Tensor,   # (N, d_T) — 教师侧的对比差值
-) -> torch.Tensor:          # (d_T, d_S) — 正交对齐矩阵
-    """求解 W* = argmin_{W: W^T W = cI} ||W @ source.T - target.T||_F
-    
-    即最优正交+缩放矩阵，将学生差值空间对齐到教师差值空间。
-    解析解：W = U @ Vh，其中 M = target.T @ source = U S Vh (SVD)
+    source: torch.Tensor,   # (N, d_S)
+    target: torch.Tensor,   # (N, d_T)
+) -> torch.Tensor:          # (d_T, d_S)
+    """W* = argmin ||target - source @ W^T||_F,  s.t. W^T W = cI
+    解析解：M = target^T @ source, SVD → W = U @ Vh
     """
-    assert source.shape[0] == target.shape[0], "Sample count mismatch"
+    assert source.shape[0] == target.shape[0]
     
-    # 中心化
-    source_centered = source - source.mean(dim=0, keepdim=True)  # (N, d_S)
-    target_centered = target - target.mean(dim=0, keepdim=True)  # (N, d_T)
+    source_c = source - source.mean(dim=0, keepdim=True)  # (N, d_S)
+    target_c = target - target.mean(dim=0, keepdim=True)  # (N, d_T)
     
-    M = target_centered.T @ source_centered  # (d_T, d_S)
-    U, S, Vh = torch.linalg.svd(M, full_matrices=False)  # U: (d_T, k), Vh: (k, d_S)
+    eps = 1e-8
+    source_c = source_c / source_c.norm(dim=-1, keepdim=True).clamp(min=eps)
+    target_c = target_c / target_c.norm(dim=-1, keepdim=True).clamp(min=eps)
+    
+    M = target_c.T @ source_c  # (d_T, d_S)
+    try:
+        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        M_reg = M + 1e-6 * torch.eye(min(M.shape), device=M.device)
+        U, S, Vh = torch.linalg.svd(M_reg, full_matrices=False)
     
     W = U @ Vh  # (d_T, d_S)
-    
-    # 验证正交性
-    if W.shape[0] == W.shape[1]:
-        orthogonality_error = (W @ W.T - torch.eye(W.shape[0], device=W.device)).norm()
-        assert orthogonality_error < 1e-4, f"W not orthogonal: error = {orthogonality_error:.6f}"
-    
     return W
 ```
 
-**测试要求**：
-- 构造已知旋转：`target = source @ R.T + noise`，验证恢复的 W ≈ R
-- d_T ≠ d_S 时验证 W 的维度正确
-
-### 3.3 CKA 层匹配 (`alignment/layer_matching.py`)
-
-```python
-def find_best_layer_mapping(
-    teacher_imprints_by_layer: dict[int, torch.Tensor],  # {l: (N, d_T)}
-    student_imprints_by_layer: dict[int, torch.Tensor],  # {l': (N, d_S)}
-) -> dict[int, int]:  # {teacher_layer: best_student_layer}
-    """对每个教师检查点层，找到 CKA 最高的学生层。"""
-    mapping = {}
-    
-    for t_layer, t_data in teacher_imprints_by_layer.items():
-        best_score, best_layer = -1.0, -1
-        for s_layer, s_data in student_imprints_by_layer.items():
-            score = linear_cka(t_data, s_data)
-            if score > best_score:
-                best_score = score
-                best_layer = s_layer
-        mapping[t_layer] = best_layer
-        logger.info(f"Teacher L{t_layer} → Student L{best_layer} (CKA={best_score:.4f})")
-    
-    return mapping
-```
-
-### 3.4 RCID 损失 (`distillation/rcid_loss.py`)
+### 5.4 RCID 损失 (`distillation/rcid_loss.py`)
 
 ```python
 class RCIDLoss(nn.Module):
     """残差因果印记蒸馏损失。
     
-    核心公式:
-        L_RCID = (1/|C|) Σ_{(l,t)∈C} || normalize(W* @ d^S_{l,t}) - normalize(d^T_{l,t}) ||²
-    
-    其中:
-        d^T = r^T(x_clean) - r^T(x_corrupt)   (教师因果痕迹，预计算)
-        d^S = r^S(x_clean) - r^S(x_corrupt)   (学生因果痕迹，每步计算)
-        W*: 冻结的 Procrustes 对齐矩阵
+    在因果检查点位置匹配 teacher 和 student 的因果差值（d = h_clean - h_corrupt）。
+    W 是冻结 Procrustes 矩阵（buffer）。教师痕迹预计算（detached）。
+    学生的两次前向传播（clean + corrupt）保留梯度。
     """
     
     def __init__(
         self,
-        W: torch.Tensor,                        # (d_T, d_S), 冻结
-        checkpoints: list[tuple[int, int]],      # [(teacher_layer, token_pos), ...]
-        layer_mapping: dict[int, int],           # {teacher_layer: student_layer}
-        eps: float = 1e-8,
+        checkpoints: list[tuple[int, int]],
+        layer_mapping: dict[int, int],
+        W_matrices: dict[int, torch.Tensor],
     ):
         super().__init__()
-        self.register_buffer("W", W)             # 不参与梯度更新
         self.checkpoints = checkpoints
         self.layer_mapping = layer_mapping
-        self.eps = eps
+        for t_layer, W in W_matrices.items():
+            self.register_buffer(f"W_{t_layer}", W)
     
     def forward(
         self,
-        teacher_imprints: dict[tuple[int, int], torch.Tensor],  # 预计算，{(l,t): (B, d_T)}
-        student_model: nn.Module,
-        clean_input: torch.Tensor,   # (B, seq_len)
-        corrupt_input: torch.Tensor, # (B, seq_len)
+        teacher_imprints: dict[tuple[int, int], torch.Tensor],  # 预计算, detached
+        student: nn.Module,
+        clean_input: torch.Tensor,
+        corrupt_input: torch.Tensor,
     ) -> torch.Tensor:
-        # 提取学生的对比差值
-        student_layers = sorted(set(self.layer_mapping[l] for l, t in self.checkpoints))
-        student_residuals_clean = self._get_residuals(student_model, clean_input, student_layers)
-        student_residuals_corrupt = self._get_residuals(student_model, corrupt_input, student_layers)
-        
+        eps = 1e-8
         total_loss = torch.tensor(0.0, device=clean_input.device)
         
-        for l_t, t_pos in self.checkpoints:
-            l_s = self.layer_mapping[l_t]
-            
-            # 教师痕迹（预计算）
-            d_T = teacher_imprints[(l_t, t_pos)]  # (B, d_T)
-            
-            # 学生痕迹（在线计算）
-            d_S = (student_residuals_clean[l_s][:, t_pos, :]    # (B, d_S)
-                   - student_residuals_corrupt[l_s][:, t_pos, :])
-            
-            # Procrustes 对齐
-            d_S_aligned = d_S @ self.W.T  # (B, d_T)
-            
-            # 归一化后的 MSE（等价于 2(1 - cos θ)）
-            d_T_norm = d_T / (d_T.norm(dim=-1, keepdim=True) + self.eps)      # (B, d_T)
-            d_S_norm = d_S_aligned / (d_S_aligned.norm(dim=-1, keepdim=True) + self.eps)  # (B, d_T)
-            
-            checkpoint_loss = (d_T_norm - d_S_norm).pow(2).sum(dim=-1).mean()  # scalar
-            total_loss = total_loss + checkpoint_loss
+        # 学生前向（保留梯度，hooks 中不 detach）
+        student_clean = self._extract_residuals(student, clean_input)
+        student_corrupt = self._extract_residuals(student, corrupt_input)
         
-        return total_loss / len(self.checkpoints)
-    
-    def _get_residuals(
-        self,
-        model: nn.Module,
-        input_ids: torch.Tensor,
-        layers: list[int],
-    ) -> dict[int, torch.Tensor]:  # {layer: (B, seq_len, d_model)}
-        """一次前向传播提取多层残差流。"""
-        residuals = {}
-        handles = []
+        for (t_layer, t_pos) in self.checkpoints:
+            s_layer = self.layer_mapping[t_layer]
+            W = getattr(self, f"W_{t_layer}")  # (d_T, d_S)
+            
+            d_T = teacher_imprints[(t_layer, t_pos)]  # (batch, d_T), no grad
+            d_S = (
+                student_clean[s_layer][:, t_pos, :]
+                - student_corrupt[s_layer][:, t_pos, :]
+            )  # (batch, d_S), has grad
+            
+            aligned = d_S @ W.T  # (batch, d_T)
+            aligned_n = aligned / aligned.norm(dim=-1, keepdim=True).clamp(min=eps)
+            d_T_n = d_T / d_T.norm(dim=-1, keepdim=True).clamp(min=eps)
+            
+            total_loss = total_loss + (aligned_n - d_T_n).pow(2).sum(dim=-1).mean()
         
-        for layer in layers:
-            storage = {}
-            handle = model.transformer.h[layer].register_forward_hook(
-                lambda mod, inp, out, s=storage: s.update({"r": out[0].detach()})
-            )
-            handles.append((handle, storage, layer))
-        
-        with torch.no_grad():
-            model(input_ids)
-        
-        for handle, storage, layer in handles:
-            residuals[layer] = storage["r"]
-            handle.remove()
-        
-        return residuals
+        total_loss = total_loss / len(self.checkpoints)
+        assert total_loss.isfinite(), f"RCID loss is {total_loss.item()}"
+        return total_loss
 ```
 
-**测试要求**：
-- 教师=学生，W=I 时，损失应为零
-- 随机 W 时损失应 > 0
-- 梯度应只流过学生模型，不流过教师痕迹和 W
+### 5.5 Informed FitNets (`distillation/baselines.py`)
+
+```python
+class InformedFitNetsLoss(nn.Module):
+    """在因果检查点位置匹配完整表示（非因果差值）。
+    
+    与 RCID 共享 checkpoints 和 W，唯一区别：
+    - RCID:           匹配 d^T = h^T_clean - h^T_corrupt
+    - InformedFitNets: 匹配 h^T_clean
+    
+    关键消融基线：拆解 RCID 的优势来自"选对位置"还是"匹配因果差值"。
+    """
+    
+    def forward(
+        self,
+        teacher_representations: dict[tuple[int, int], torch.Tensor],  # h^T_clean
+        student: nn.Module,
+        clean_input: torch.Tensor,
+        # 不需要 corrupt_input
+    ) -> torch.Tensor:
+        ...
+```
 
 ---
 
-## 四、实验配置规范
+## 六、IOI 数据集规范
 
-### 4.1 配置文件模板 (`configs/base.yaml`)
+### 6.1 对比对构造
+
+```
+Clean:   "When Mary and John went to the store, John gave a drink to"  → Mary
+Corrupt: "When Mary and John went to the store, Mary gave a drink to"  → ???
+
+区别仅在 S2 位置（后半句的主语）：clean 放 S_name，corrupt 放 IO_name。
+```
+
+### 6.2 模板拼接
+
+```python
+# 名字带前导空格（GPT-2 BPE 的句中 token 形式）
+NAMES = [" Dan", " Bob", " Tom", " James", " Mark", " Luke", " Adam", " Paul", " Jack", " Ben",
+         " Mary", " Kate", " Alice", " Emma", " Jane", " Anna", " Sara", " Lisa", " Amy", " Rose"]
+
+TEMPLATES = [
+    {"setup": "When{IO} and{S} went to the store,", "action": "{S} gave a drink to"},
+    ...
+]
+
+# 拼接时不要额外加空格，名字的前导空格充当分隔
+clean_text = template["setup"].format(IO=io_name, S=s_name) + template["action"].format(S=s_name)
+```
+
+### 6.3 每个样本必须记录
+
+```python
+@dataclass
+class IOISample:
+    clean_ids: torch.Tensor         # token ids
+    corrupt_ids: torch.Tensor
+    io_token_pos: int               # IO name 位置（未被修改）
+    s2_token_pos: int               # S name 第二次出现位置（被修改）
+    end_token_pos: int              # 句末位置（未被修改，输出答案处）
+    correct_token_id: int           # IO name 的 token id
+    wrong_token_id: int             # S name 的 token id
+    template_index: int             # 模板编号（用于 control label）
+    is_modified: dict[str, bool]    # {"io": False, "s2": True, "end": False}
+```
+
+---
+
+## 七、编码规范
+
+### 7.1 类型标注（强制）
+
+所有函数签名完整标注。
+
+### 7.2 Tensor Shape 注释（强制）
+
+```python
+residual = storage["h"][:, token_pos, :]  # (batch, d_model)
+```
+
+### 7.3 断言检查
+
+```python
+assert teacher_imprint.dim() == 2, f"Expected 2D, got {teacher_imprint.dim()}D"
+assert loss.isfinite(), f"Loss is {loss.item()}"
+```
+
+### 7.4 Hook 生命周期管理
+
+```python
+handle = model.transformer.h[layer].register_forward_hook(hook_fn)
+try:
+    model(input_ids)
+finally:
+    handle.remove()
+```
+
+### 7.5 梯度流管理
+
+- 教师模型：始终 eval + no_grad
+- 教师痕迹：预计算后 detach
+- W 矩阵：注册为 buffer（不参与梯度更新）
+- 学生前向传播：保留梯度（hooks 中不 detach）
+
+### 7.6 数值稳定性
+
+```python
+eps = 1e-8
+norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
+```
+
+### 7.7 文件长度
+
+每个 `.py` 不超过 300 行。
+
+---
+
+## 八、GPT-2 残差流细节
+
+```python
+# GPT-2 block 输出：output = (hidden_states, present_key_values, ...)
+# output[0] = 残差流（含 attention + MLP + 残差连接）
+# GPT-2 用 pre-LN 架构
+# model.transformer.h[0] 是最底层，h[11] 是最顶层（GPT-2 Small）
+```
+
+---
+
+## 九、实验配置
+
+### 9.1 模型
 
 ```yaml
-# 模型
 teacher:
-  name: "gpt2"                 # HuggingFace model ID
+  name: gpt2
   n_layers: 12
   d_model: 768
-  
-student:
-  name: "custom_4layer"        # 或 "distilgpt2"
-  n_layers: 4
-  d_model: 384                 # 故意与教师不同，测试跨维度
 
-# 回路分析
-circuit:
-  task: "ioi"                  # ioi / greater_than / acronym
-  n_contrastive_pairs: 500     # 对比数据集大小
-  top_k_checkpoints: 5         # 选择因果效应最大的 k 个检查点
-  
-# 对齐
-alignment:
-  calibration_size: 200        # Procrustes 校准集大小
-  layer_matching: "cka"        # cka / linear_probe / manual
-  
-# 蒸馏训练
+student:
+  n_layers: 4
+  d_model: 384
+  n_heads: 6
+```
+
+### 9.2 实验矩阵
+
+```yaml
+methods: [standard_kd, fitnets, informed_fitnets, rcid]
+primary_task: ioi
+generalization_task: greater_than
+seeds: [42, 123, 456]
+# 核心: 4 methods × 1 task × 3 seeds = 12 runs
+# 泛化: 4 methods × 1 task × 1 seed = 4 runs
+```
+
+### 9.3 训练超参数
+
+```yaml
 training:
   epochs: 20
   batch_size: 32
   lr: 5e-5
-  lambda_rcid: 1.0             # L_RCID 权重
-  lambda_kl: 1.0               # L_KL 权重
-  optimizer: "adamw"
-  scheduler: "cosine"
-  seed: 42
-
-# 评估
-eval:
-  metrics:
-    - "task_accuracy"           # IOI 准确率
-    - "causal_consistency"      # 因果干预一致性
-    - "perplexity"              # WikiText 困惑度（通用能力）
-```
-
-### 4.2 实验矩阵
-
-```yaml
-# exp2_distillation_comparison.yaml
-# 继承 base.yaml，覆盖蒸馏方法
-
-methods:
-  - name: "standard_kd"
-    lambda_rcid: 0.0
-    lambda_kl: 1.0
-    
-  - name: "fitnets"
-    intermediate_matching: "all_layers"
-    
-  - name: "prakash"
-    component_mapping: "ablation_similarity"
-    alignment_loss: "cka"
-    
-  - name: "rcid"
-    lambda_rcid: 1.0
-    lambda_kl: 1.0
-
-seeds: [42, 123, 456]  # 每个方法跑 3 个种子
+  optimizer: adamw
+  scheduler: cosine
+  grad_clip: 1.0
+  lambda_kl: 1.0
+  lambda_rcid: 1.0
 ```
 
 ---
 
-## 五、Claude Code 交互规范
-
-### 5.1 Prompt 模板
-
-在使用 Claude Code 时，遵循以下 prompt 结构：
+## 十、实施优先级
 
 ```
-## 任务
-[一句话描述要做什么]
+P0（阻塞一切）:
+  实现 circuit/intervention.py (patch_and_run, compute_causal_effect)
+  实现 eval/causal_consistency.py
+  修复 IOI 数据集双空格 bug
+  修复 rcid_loss.py batch indexing
+  修复 procrustes.py L2 normalization
 
-## 上下文
-- 当前文件: [路径]
-- 依赖: [相关模块]
-- 数学公式: [如果涉及]
+P1（核心实验）:
+  改进检查点选择策略（多样性约束）
+  实现 Informed FitNets 基线
+  运行实验 1（蒸馏 + 因果一致性评估）
+  运行实验 2（4 方法对比，证明 RCID 优于其他方法）
 
-## 约束
-- 类型标注完整
-- tensor shape 注释
-- 关键位置加 assert
-- 不超过 300 行
+P2（完善论文）:
+  实现 OOD Robustness 评估
+  实现 Information Purity Test
+  运行实验 3（一致性 vs 鲁棒性相关性）
+  运行实验 4（组件级分析）
+  运行实验 5（信息纯度）
 
-## 验证
-完成后运行: pytest tests/test_xxx.py -v
-```
-
-### 5.2 分步实现策略
-
-**不要一次性让 Claude Code 写完整个项目。** 按以下顺序逐模块实现和验证：
-
-```
-阶段1: 基础设施
-  ├── 1a. 项目结构搭建（pyproject.toml, 目录）
-  ├── 1b. 模型加载与残差流提取 → test_model_loading.py
-  └── 1c. 对比数据集构建（IOI） → test_contrastive_data.py
-
-阶段2: 因果痕迹
-  ├── 2a. activation patching → test_patching.py
-  ├── 2b. 检查点选择 → test_checkpoint_selection.py
-  └── 2c. 痕迹可视化（notebook）→ 目视确认语义合理性
-
-阶段3: 跨模型对齐
-  ├── 3a. CKA 实现 → test_cka.py
-  ├── 3b. 层匹配搜索 → test_layer_matching.py
-  └── 3c. Procrustes 对齐 → test_procrustes.py
-
-阶段4: 蒸馏训练
-  ├── 4a. RCID 损失函数 → test_rcid_loss.py
-  ├── 4b. 训练循环 → 小规模 sanity check（overfit 10 个样本）
-  └── 4c. 基线方法实现 → test_baselines.py
-
-阶段5: 评估与实验
-  ├── 5a. 评估指标 → test_eval.py
-  ├── 5b. 完整实验运行
-  └── 5c. 结果分析与作图
-```
-
-### 5.3 代码审查 Checklist
-
-每次 Claude Code 生成代码后，检查以下项目：
-
-```
-□ 函数签名有完整类型标注
-□ 所有 tensor 变量旁有 shape 注释
-□ 维度变换处有 assert
-□ hooks 在 context manager 中管理
-□ 数值计算有 eps 保护
-□ 没有硬编码的超参数（全在 config 中）
-□ W 矩阵被注册为 buffer（不参与梯度更新）
-□ 教师模型始终在 eval + no_grad 下
-□ 损失值有 isfinite 检查
-□ 有对应的单元测试
+P3（论文材料）:
+  论文图表生成
+  结果分析脚本
 ```
 
 ---
 
-## 六、常见陷阱与防范
+## 十一、符号速查
 
-### 6.1 梯度流动错误
-
-```python
-# ❌ 危险：教师痕迹参与了学生的计算图
-teacher_imprint = get_imprint(teacher, x_c, x_p, l, t)  # 有梯度！
-loss = rcid_loss(teacher_imprint, student_imprint)
-loss.backward()  # 梯度意外流入教师模型
-
-# ✅ 正确：教师痕迹必须 detach 或在 no_grad 下计算
-with torch.no_grad():
-    teacher_imprint = get_imprint(teacher, x_c, x_p, l, t)
-# 或者
-teacher_imprint = get_imprint(teacher, x_c, x_p, l, t).detach()
-```
-
-### 6.2 学生前向传播的梯度
-
-```python
-# ❌ 错误：学生的对比差值也在 no_grad 下计算了
-with torch.no_grad():
-    d_S = get_student_residual(student, x_c, l_s, t) - get_student_residual(student, x_p, l_s, t)
-# d_S 没有梯度，loss.backward() 无法更新学生
-
-# ✅ 正确：学生的前向传播需要保留梯度
-# 但注意：hooks 中不要 detach
-handle = model.transformer.h[layer].register_forward_hook(
-    lambda mod, inp, out, s=storage: s.update({"r": out[0]})  # 不加 .detach()
-)
-student(clean_input)     # 这次前向保留梯度
-d_S_clean = storage["r"][:, t, :]  # 有梯度
-
-student(corrupt_input)   # 这次也保留梯度
-d_S_corrupt = storage["r"][:, t, :]
-
-d_S = d_S_clean - d_S_corrupt  # 有梯度，可以 backward
-```
-
-**但这意味着每步训练需要两次前向传播（clean 和 corrupt），是主要的额外开销。**
-
-### 6.3 GPT-2 残差流提取的具体细节
-
-```python
-# GPT-2 的 transformer block 输出格式：
-# output = (hidden_states, present_key_values, attentions)
-# hidden_states 就是残差流（包含了 attention + MLP 的贡献 + 残差连接）
-
-# 但要注意：
-# - model.transformer.h[i] 输出的是该 block 处理后的残差流
-# - 如果要获取 block 输入端的残差流，需要 hook 到 h[i] 的输入
-# - 对于 RCID，我们需要的是 block 输出端（包含了该层的贡献）
-
-# 层归一化的位置也重要：
-# GPT-2 用 pre-LN，所以 block 输出 = block 输入 + Attn(LN(input)) + MLP(LN(...))
-# 残差流 = h[i] 的输出 = 已经包含了残差连接
-```
-
-### 6.4 对比数据集质量
-
-```python
-# IOI 对比对的构造必须严格遵循 "最小修改" 原则
-# ✅ 正确：只替换关键信息
-clean   = "When Mary and John went to the store, John gave a drink to"
-corrupt = "When Mary and John went to the store, Mary gave a drink to"
-# 仅替换第二个名字：John → Mary
-
-# ❌ 错误：改变了太多内容
-corrupt = "When Alice and Bob went to the park, Bob gave a drink to"
-# 改了名字 + 地点，差值会混入地点信息
-```
+| 符号 | 含义 | 代码 |
+|------|------|------|
+| $h_{l,t}$ | 第 $l$ 层第 $t$ 位置的残差流 | `residual[layer][:, pos, :]` |
+| $d_{l,t}^T$ | 教师因果痕迹 $= h_{\text{clean}} - h_{\text{corrupt}}$ | `teacher_imprint` |
+| $d_{l,t}^S$ | 学生因果痕迹 | `student_imprint` |
+| $W^*$ | 冻结 Procrustes 矩阵 | `W` (buffer) |
+| $\hat{l}$ | 学生中与教师层 $l$ 匹配的层 | `layer_mapping[l]` |
+| $\Delta_T$ | teacher 做 patching 后的行为变化 | `delta_T` |
+| $\Delta_S$ | student 做 patching 后的行为变化 | `delta_S` |
+| CC | 因果一致性 $= \text{Pearson}(\Delta_T, \Delta_S)$ | `causal_consistency` |
 
 ---
 
-## 七、可复现性要求
-
-```python
-# 在每个 script 入口处
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-# 记录实验环境
-def log_environment():
-    logger.info(f"Python: {sys.version}")
-    logger.info(f"PyTorch: {torch.__version__}")
-    logger.info(f"Transformers: {transformers.__version__}")
-    logger.info(f"CUDA: {torch.version.cuda}")
-    logger.info(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
-    logger.info(f"Config: {OmegaConf.to_yaml(cfg)}")
-```
-
----
-
-## 八、依赖清单
+## 十二、依赖
 
 ```toml
-# pyproject.toml
 [project]
 name = "rcid"
 requires-python = ">=3.10"
@@ -656,34 +641,11 @@ dependencies = [
     "omegaconf>=2.3",
     "wandb>=0.16",
     "einops>=0.7",
-    "scipy>=1.11",          # Procrustes SVD
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
     "matplotlib>=3.8",
     "seaborn>=0.13",
     "pytest>=7.4",
     "tqdm>=4.66",
 ]
-
-[project.optional-dependencies]
-dev = ["ruff", "mypy", "ipykernel"]
 ```
-
----
-
-## 九、关键数学公式速查
-
-供 Claude Code 理解代码意图时参考：
-
-| 符号 | 含义 | 代码变量名 |
-|------|------|-----------|
-| $\mathbf{d}_{l,t}^T$ | 教师在层 $l$、位置 $t$ 的因果痕迹 | `teacher_imprint` |
-| $\mathbf{d}_{\hat{l},t}^S$ | 学生在对应层的因果痕迹 | `student_imprint` |
-| $W^*$ | 冻结的 Procrustes 对齐矩阵 | `W` (registered buffer) |
-| $\hat{l}$ | 学生中与教师层 $l$ 最匹配的层 | `layer_mapping[l]` |
-| $\mathcal{L}_{\text{RCID}}$ | 因果痕迹对齐损失 | `rcid_loss` |
-| $\mathcal{L}_{\text{KL}}$ | 输出分布对齐损失 | `kl_loss` |
-| $\lambda$ | RCID 损失权重 | `config.training.lambda_rcid` |
-| $\mathcal{C}$ | 因果检查点集合 | `checkpoints: list[tuple[int, int]]` |
-
-### 损失函数完整形式
-
-$$\mathcal{L} = \mathcal{L}_{\text{KL}}(y_T, y_S) + \lambda \cdot \frac{1}{|\mathcal{C}|} \sum_{(l,t) \in \mathcal{C}} \left\| \frac{W^* \mathbf{d}_{\hat{l},t}^{S}}{\|W^* \mathbf{d}_{\hat{l},t}^{S}\|} - \frac{\mathbf{d}_{l,t}^{T}}{\|\mathbf{d}_{l,t}^{T}\|} \right\|^2$$
