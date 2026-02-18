@@ -1,0 +1,24 @@
+# Experiment 5: Cross-architecture generalization (LLaMA 3).
+# Repeats core experiments on LLaMA-3-8B → LLaMA-3.2-1B.
+# Core evidence for Main Line C.
+
+experiment: exp5_cross_architecture
+
+model_family: llama3
+
+methods:
+  - standard_kd
+  - rcid
+
+tasks:
+  - ioi
+  - factual_probing
+
+data:
+  n_samples: 500
+
+evaluation:
+  task_accuracy: true
+  causal_consistency: true
+
+output_dir: outputs/results/exp5_cross_arch

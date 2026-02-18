@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(git -C \"W:\\\\Beyond Output Mimicry Preserving Internal Mechanisms in Knowledge Distillation via Contrastive Residual Alignment\\\\RCID\" log --oneline --all)",
+      "Bash(pip install:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python:*)"
+    ]
+  }
+}

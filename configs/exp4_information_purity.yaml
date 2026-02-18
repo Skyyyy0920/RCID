@@ -1,0 +1,19 @@
+# Experiment 4: Information purity of contrastive differences.
+# Compares selectivity of h^T (raw representations) vs d^T (contrastive
+# differences) at unmodified token positions.
+
+experiment: exp4_information_purity
+
+tasks:
+  - ioi
+  - factual_probing
+  - winogrande
+
+data:
+  n_samples: 500
+
+probe:
+  test_size: 0.2
+  max_iter: 1000
+
+output_dir: outputs/results/exp4

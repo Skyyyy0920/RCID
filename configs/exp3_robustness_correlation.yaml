@@ -1,0 +1,26 @@
+# Experiment 3: Mechanistic consistency vs behavioral robustness.
+# Collects (causal_consistency, ood_degradation) from all students
+# trained in exp1 + exp2, then computes Pearson correlation.
+
+experiment: exp3_robustness_correlation
+
+source_experiments:
+  - outputs/results/exp1
+  - outputs/results/exp2
+
+ood_variants:
+  ioi:
+    - unseen_names
+    - different_templates
+    - longer_context
+  factual_probing:
+    - different_relations
+    - different_entities
+  winogrande:
+    - longer_sentences
+    - multiple_distractors
+
+data:
+  n_samples: 200
+
+output_dir: outputs/results/exp3

@@ -1,0 +1,17 @@
+# Qwen3 model family configuration.
+
+model_family: qwen3
+
+teacher:
+  name: Qwen/Qwen3-8B
+  n_layers: 36
+  d_model: 4096
+  vocab_size: 151936
+
+student:
+  name: Qwen/Qwen3-0.6B
+  n_layers: 28
+  d_model: 1024
+  vocab_size: 151936
+
+dtype: float16

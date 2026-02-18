@@ -1,0 +1,17 @@
+# LLaMA 3 model family configuration.
+
+model_family: llama3
+
+teacher:
+  name: meta-llama/Llama-3.1-8B
+  n_layers: 32
+  d_model: 4096
+  vocab_size: 128256
+
+student:
+  name: meta-llama/Llama-3.2-1B
+  n_layers: 16
+  d_model: 2048
+  vocab_size: 128256
+
+dtype: float16

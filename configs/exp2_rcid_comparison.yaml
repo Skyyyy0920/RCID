@@ -1,0 +1,28 @@
+# Experiment 2: Can RCID improve mechanism transfer?
+# Full 4-method comparison. Core evidence for Main Line B.
+# Factor decomposition:
+#   FitNets → InformedFitNets = "correct position" contribution
+#   InformedFitNets → RCID = "contrastive difference" contribution
+
+experiment: exp2_rcid_comparison
+
+methods:
+  - standard_kd
+  - fitnets
+  - informed_fitnets
+  - rcid
+
+tasks:
+  - ioi
+  - factual_probing
+  - winogrande
+
+data:
+  n_samples: 500
+
+evaluation:
+  task_accuracy: true
+  causal_consistency: true
+  perplexity: true
+
+output_dir: outputs/results/exp2

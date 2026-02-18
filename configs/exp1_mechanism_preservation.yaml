@@ -1,0 +1,19 @@
+# Experiment 1: Do existing distillation methods preserve teacher mechanisms?
+# Tests baselines only (no RCID). Core evidence for Main Line A.
+
+experiment: exp1_mechanism_preservation
+
+methods:
+  - standard_kd
+  - fitnets
+  - informed_fitnets
+
+tasks:
+  - ioi
+  - factual_probing
+  - winogrande
+
+data:
+  n_samples: 500
+
+output_dir: outputs/results/exp1
