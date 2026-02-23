@@ -1,5 +1,5 @@
 # Large-scale distillation configuration
-# Experiment 3: Standard KD + RCID regularizer on real benchmarks
+# Standard KD + RCID regularizer on real benchmarks
 
 experiment: large_scale_distillation
 
@@ -14,10 +14,31 @@ data:
   max_samples: 52000
   max_seq_len: 512
 
-# Contrastive pairs (for RCID)
+# Contrastive pairs (for RCID / FitNets / InformedFitNets)
+# Per-task generation: each generator has independent quota and output file
 contrastive:
-  pairs_path: data/contrastive_pairs.json
-  max_pairs: 5000
+  # Directory containing per-task JSONs (e.g. entity_swap.json, number_perturb.json)
+  pairs_dir: data/contrastive_pairs/
+  # Legacy single-file path (used if pairs_dir does not exist)
+  pairs_path_legacy: data/contrastive_pairs.json
+  # Which task types to load (null = load all .json files in pairs_dir)
+  task_types: null  # e.g. [entity_swap, number_perturb]
+
+  # Per-generator generation settings
+  generators:
+    entity_swap:
+      enabled: true
+      max_pairs: 2500
+    number_perturb:
+      enabled: true
+      max_pairs: 2500
+    llm:
+      enabled: false
+      max_pairs: 2500
+
+  # Generation data source
+  data_source: tatsu-lab/alpaca
+  max_samples: 10000
 
 # Training
 training:

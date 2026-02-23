@@ -2,13 +2,14 @@
 
 > **项目名称**: RCID (Residual Causal Imprint Distillation)
 > **核心问题**: 蒸馏后的 student 内部推理机制是否与 teacher 一致？如何让它一致？
+> **核心定位**: RCID 是一个**即插即用的机制对齐正则项**，嫁接到标准蒸馏流程上，让学生不仅"表现得像"教师，也"思考得像"教师。
 > **模型配对（主实验）**: Qwen3-8B (teacher) → Qwen3-0.6B (student)
 > **模型配对（泛化验证）**: LLaMA-3-8B (teacher) → LLaMA-3.2-1B (student)
 > **硬件**: 4 × A100 80GB
 
 ---
 
-## 一、论文的两条主线
+## 一、论文的四条主线
 
 ### 主线 A：发现问题
 
@@ -17,12 +18,28 @@
 
 ### 主线 B：解决问题
 
-我们提出 RCID，一种对比差值引导的蒸馏方法。通过在因果关键位置匹配 teacher 和 student
-的残差流对比差值（而非原始表示），RCID 在任务准确率、因果一致性、OOD 鲁棒性上均优于现有方法。
+我们提出 RCID，一种对比差值引导的蒸馏正则项。通过在因果关键位置匹配 teacher 和 student
+的残差流对比差值（而非原始表示），RCID 在因果一致性、信息纯度、OOD 鲁棒性上均优于现有方法。
 
-### 主线 C：跨架构泛化
+### 主线 C：实用性验证（大规模蒸馏）
 
-在 LLaMA 3 上重复核心实验，证明方法不依赖于特定架构，从 GQA 分组策略到 QK-Norm 的有无均不影响有效性。
+将 RCID 作为正则项嫁接到大规模 KL 蒸馏上，通过自动构造的对比对，
+在 MMLU、GSM8K、ARC 等真实 benchmark 上带来可测量的提升。
+
+### 主线 D：跨架构泛化
+
+在 LLaMA 3 上重复核心实验，证明方法不依赖于特定架构。
+
+### 论文核心叙事
+
+> "标准蒸馏让学生**表现得像**教师（输出分布对齐），
+> RCID 正则让学生**思考得像**教师（内部推理机制对齐），两者互补。"
+
+1. 我们发现标准蒸馏不保留教师的推理机制（实验 1）
+2. 提出 RCID 方法并在受控环境下验证其有效性（实验 2）
+3. 展示将 RCID 作为正则项嫁接到大规模蒸馏上可以提升学生在真实 benchmark 上的表现（实验 3，核心实用性实验）
+4. 通过 OOD 鲁棒性实验证明机制保留带来更好的泛化（实验 4）
+5. 通过因果分析和跨架构验证解释了提升的来源（实验 5）
 
 ---
 
@@ -53,11 +70,21 @@ $$\text{CausalConsistency} = \text{Pearson}(\Delta_T, \Delta_S)$$
 - $\Delta_S$：对 student 在对应位置做同样 patching 后的输出变化
 - student 的 patching 值来自 student 自身的 corrupt 前向传播（不是 teacher 的）
 
-### 2.3 RCID 损失
+### 2.3 RCID 损失（正则项形式）
 
-$$\mathcal{L} = \mathcal{L}_{\text{KL}} + \lambda \cdot \frac{1}{|\mathcal{C}|} \sum_{(l,t) \in \mathcal{C}} \left\| \frac{W^* d_{\hat{l},t}^{S}}{\|W^* d_{\hat{l},t}^{S}\|} - \frac{d_{l,t}^{T}}{\|d_{l,t}^{T}\|} \right\|^2$$
+**完整损失函数：**
 
-其中 $d = h_{\text{clean}} - h_{\text{corrupt}}$ 是对比差值，$W^*$ 是冻结的 Procrustes 对齐矩阵。
+$$\mathcal{L} = \underbrace{\mathcal{L}_{\text{KL}}^{\text{seq-level}}}_{\text{全序列 KL 蒸馏}} + \lambda \cdot \underbrace{\frac{1}{|\mathcal{C}|} \sum_{(l,t) \in \mathcal{C}} \left\| \frac{W^* d_{\hat{l},t}^{S}}{\|W^* d_{\hat{l},t}^{S}\|} - \frac{d_{l,t}^{T}}{\|d_{l,t}^{T}\|} \right\|^2}_{\text{RCID 因果差值匹配正则项}}$$
+
+其中：
+- $\mathcal{L}_{\text{KL}}^{\text{seq-level}}$ 是在**所有 token 位置**上的 per-token KL 散度（主损失，保证通用能力）
+- $d = h_{\text{clean}} - h_{\text{corrupt}}$ 是对比差值
+- $W^*$ 是冻结的 Procrustes 对齐矩阵
+- $\mathcal{C}$ 是因果检查点集合
+
+**两个数据流：**
+- **主数据流**：大规模指令数据（Alpaca-52K 等），计算全序列 KL
+- **RCID 数据流**：少量自动构造的对比对（~5K），计算因果差值匹配
 
 ### 2.4 因果检查点选择
 
@@ -70,54 +97,70 @@ $$\mathcal{L} = \mathcal{L}_{\text{KL}} + \lambda \cdot \frac{1}{|\mathcal{C}|} 
 
 ---
 
-## 三、模型架构
+## 三、KL Loss 规范（关键设计决策）
 
-### 3.1 架构抽象层
+### 3.1 全序列 KL（强制）
+
+**所有蒸馏方法必须使用全序列 per-token KL，不再仅在 answer_pos 计算。**
+
+理由：
+1. 与主流蒸馏方法（DistilBERT、MiniLM、TinyBERT、SDFT/SDPO）一致
+2. 全序列 KL 保护学生的语言建模能力，避免只学到单个位置的输出
+3. RCID 的价值通过附加正则项体现，而非通过削弱基线来人为放大
+4. 大规模蒸馏场景下真实指令数据没有单一 answer position
+
+### 3.2 StandardKDLoss 接口
+
+```python
+class StandardKDLoss(nn.Module):
+    def forward(
+        self,
+        teacher_logits: torch.Tensor,  # (batch, seq_len, vocab) 或 (batch, vocab)
+        student_logits: torch.Tensor,  # 同 teacher
+        mask: torch.Tensor | None = None,  # (batch, seq_len)，1=有效，0=padding
+    ) -> torch.Tensor:
+        # 支持两种输入形状：
+        # - 3D (batch, seq, vocab)：全序列 KL，用 mask 过滤 padding
+        # - 2D (batch, vocab)：单位置 KL（向后兼容 toy data）
+```
+
+### 3.3 Trainer KL 模式
+
+```yaml
+kl_mode: "sequence"   # 全序列 KL（默认，用于所有正式实验）
+# kl_mode: "answer_only"  # 仅 answer position（仅用于调试/向后兼容）
+```
+
+UnifiedTrainer（toy data）和 ScalableDistillationTrainer（大规模数据）均已实现此逻辑。
+
+---
+
+## 四、模型架构
+
+### 4.1 架构抽象层
 
 所有代码通过 ModelAdapter 抽象层与模型交互，不直接硬编码架构细节。
 支持 Qwen3 和 LLaMA 3 两种架构。
 
 ```python
 class ModelAdapter(ABC):
-    """统一接口，屏蔽 Qwen3/LLaMA3 等架构差异。"""
-
     @abstractmethod
-    def get_layers(self, model) -> nn.ModuleList:
-        """返回 transformer 层列表。"""
-        ...
-
+    def get_layers(self, model) -> nn.ModuleList: ...
     @abstractmethod
-    def get_embed_tokens(self, model) -> nn.Embedding:
-        """返回词嵌入层。"""
-        ...
-
+    def get_embed_tokens(self, model) -> nn.Embedding: ...
     @abstractmethod
-    def get_lm_head(self, model) -> nn.Linear:
-        """返回语言模型头。"""
-        ...
-
+    def get_lm_head(self, model) -> nn.Linear: ...
     @abstractmethod
-    def get_residual_hook_point(self, model, layer_idx) -> nn.Module:
-        """返回第 layer_idx 层残差流的 hook 挂载点。"""
-        ...
-
+    def get_residual_hook_point(self, model, layer_idx) -> nn.Module: ...
     @abstractmethod
-    def parse_layer_output(self, output) -> torch.Tensor:
-        """从层输出中提取残差流张量。不同模型输出格式不同。"""
-        ...
-
+    def parse_layer_output(self, output) -> torch.Tensor: ...
     @abstractmethod
-    def get_num_layers(self, model) -> int:
-        """返回层数。"""
-        ...
-
+    def get_num_layers(self, model) -> int: ...
     @abstractmethod
-    def get_hidden_size(self, model) -> int:
-        """返回 d_model。"""
-        ...
+    def get_hidden_size(self, model) -> int: ...
 ```
 
-### 3.2 Qwen3 架构细节
+### 4.2 Qwen3 架构细节
 
 ```yaml
 Qwen3-8B (Teacher):
@@ -129,7 +172,7 @@ Qwen3-8B (Teacher):
   embed: model.model.embed_tokens
   lm_head: model.lm_head
   norm: RMSNorm (Pre-Norm) + QK-Norm
-  position: RoPE (旋转位置编码)
+  position: RoPE
   activation: SwiGLU
   layer_output: output[0]  # (batch, seq, 4096)
 
@@ -142,7 +185,7 @@ Qwen3-0.6B (Student):
   其余同上
 ```
 
-### 3.3 LLaMA 3 架构细节
+### 4.3 LLaMA 3 架构细节
 
 ```yaml
 LLaMA-3-8B (Teacher):
@@ -151,11 +194,6 @@ LLaMA-3-8B (Teacher):
   d_model: 4096
   n_heads: 32 (GQA: 32 query heads, 8 KV heads)
   vocab: 128256
-  embed: model.model.embed_tokens
-  lm_head: model.lm_head
-  norm: RMSNorm (Pre-Norm), 无 QK-Norm
-  position: RoPE
-  activation: SwiGLU
   layer_output: output[0]  # (batch, seq, 4096)
 
 LLaMA-3.2-1B (Student):
@@ -164,10 +202,9 @@ LLaMA-3.2-1B (Student):
   d_model: 2048
   n_heads: 32 (GQA: 32 query heads, 8 KV heads)
   vocab: 128256 (共享词表)
-  其余同上
 ```
 
-### 3.4 跨架构关键差异对比
+### 4.4 跨架构关键差异对比
 
 | 特性 | Qwen3 | LLaMA 3 |
 |------|-------|---------|
@@ -178,33 +215,27 @@ LLaMA-3.2-1B (Student):
 | Student 层数 | 28 | 16 |
 | Teacher d_model | 4096 | 4096 |
 | Student d_model | 1024 | 2048 |
-| HF 路径 | model.model.layers | model.model.layers |
-| 层输出格式 | output[0] | output[0] |
-| Tokenizer | Qwen tokenizer | LLaMA tokenizer |
 
-**关键：** 两个模型族的 HuggingFace 接口几乎完全一致。Adapter 差异仅在配置参数，代码逻辑可复用 90%+。
-但 **tokenizer 不同**，因此 IOI 名字池、Factual Probing 模板等都需要针对每个 tokenizer 分别验证。
-
-### 3.5 不共享名字池
-
-Qwen3 和 LLaMA 3 的 tokenizer 不同，单 token 名字列表可能不同。
-每个模型族需要独立运行 tokenizer 验证，建立各自的名字池。
-数据集类设计为接受名字池参数，不硬编码名字列表。
+两个模型族的 HuggingFace 接口几乎一致，Adapter 差异仅在配置参数。
+**Tokenizer 不同**，IOI 名字池等需要针对每个 tokenizer 分别验证。
 
 ---
 
-## 四、数据集
+## 五、数据集体系
 
-### 4.1 数据集体系
+### 5.1 两类数据
 
 ```
-验证任务：IOI（对比对质量最高，用于确认方法在两种架构上 work）
-主力任务 1：Factual Knowledge Probing（知识检索机制保留）
-主力任务 2：WinoGrande（常识推理机制保留）
-可选任务 3：Simple Math（数值推理机制保留）
+对比对数据（用于 RCID 正则 + 可解释性实验）:
+  手工构造: IOI, Factual Probing, WinoGrande, Simple Math
+  自动构造: EntitySwap, NumberPerturb, LLMGenerate（从大规模数据生成）
+
+大规模指令数据（用于主 KL 蒸馏）:
+  Alpaca-52K（初始验证）
+  SlimOrca 100K 子集（扩展验证）
 ```
 
-### 4.2 IOI（Indirect Object Identification）
+### 5.2 IOI（Indirect Object Identification）
 
 ```
 Clean:   "When Mary and John went to the store, John gave a drink to"  → Mary
@@ -212,11 +243,9 @@ Corrupt: "When Mary and John went to the store, Mary gave a drink to"  → ???
 区别仅在 S2 位置。
 ```
 
-名字池需在**对应 tokenizer** 中验证为单 token。拼接时不额外加空格。
+名字池需在**对应 tokenizer** 中验证为单 token。
 
-每个样本记录：clean_ids, corrupt_ids, io_token_pos, s2_token_pos, end_token_pos, correct_token_id, wrong_token_id, template_index, is_modified。
-
-### 4.3 Factual Knowledge Probing
+### 5.3 Factual Knowledge Probing
 
 ```
 Clean:   "The capital of France is"            → Paris
@@ -224,380 +253,266 @@ Corrupt: "The capital of Germany is"           → Berlin
 区别仅在国家名。
 ```
 
-数据源：基于 LAMA (Petroni et al., 2019) 模板批量生成，或 CounterFact (Meng et al., 2022)。
-需要确保：**对应 teacher** 准确率 > 90%，对比对仅改变一个实体。
-
-每个样本记录：clean_ids, corrupt_ids, entity_pos (被修改), answer_pos, correct_token_id, wrong_token_id, template_index, is_modified。
-
-### 4.4 WinoGrande
+### 5.4 WinoGrande
 
 ```
-Clean:   "The trophy doesn't fit in the suitcase because it is too big."
-         → it = trophy
-Corrupt: "The trophy doesn't fit in the suitcase because it is too small."
-         → it = suitcase
+Clean:   "The trophy doesn't fit in the suitcase because it is too big."  → it = trophy
+Corrupt: "The trophy doesn't fit in the suitcase because it is too small." → it = suitcase
 区别仅在关键形容词。
 ```
 
-数据源：WinoGrande 数据集筛选，确保对比差异为单词替换。
-需要：**对应 teacher** 准确率 > 80%。
+### 5.5 通用对比对接口
 
-每个样本记录：clean_ids, corrupt_ids, modified_pos, pronoun_pos, correct_referent_id, wrong_referent_id, is_modified。
-
-### 4.5 Simple Math（可选）
-
-```
-Clean:   "If John has 5 apples and gives 2, he has" → 3
-Corrupt: "If John has 7 apples and gives 2, he has" → 5
-区别仅在一个数字。
-```
-
-需先验证 student 通过标准 KD 能否达到合理准确率。如果不行则放弃。
-
-### 4.6 通用接口
-
-所有数据集继承同一基类：
+所有对比数据集继承 `ContrastiveDataset` 基类：
 
 ```python
 class ContrastiveDataset:
-    """对比数据集基类。"""
     clean_ids: torch.Tensor           # (N, seq_len)
     corrupt_ids: torch.Tensor         # (N, seq_len)
     answer_pos: torch.Tensor          # (N,)
     correct_token_id: torch.Tensor    # (N,)
     wrong_token_id: torch.Tensor      # (N,)
-    key_positions: dict[str, torch.Tensor]  # 每种关键位置的索引
-    is_modified: dict[str, bool]      # 哪些关键位置在 clean/corrupt 间不同
-    model_family: str                 # "qwen3" 或 "llama3"，标识数据是哪个 tokenizer 生成的
+    key_positions: dict[str, torch.Tensor]
+    is_modified: dict[str, bool]
+    model_family: str
+```
+
+### 5.6 大规模指令数据
+
+`InstructionDataset` 用于主 KL 蒸馏数据流：
+
+```python
+class InstructionDataset(torch.utils.data.Dataset):
+    """从 HuggingFace 加载 Alpaca/SlimOrca 等指令数据。"""
+    def __getitem__(self, idx) -> dict:
+        return {
+            "input_ids": torch.Tensor,      # (seq_len,)
+            "attention_mask": torch.Tensor,  # (seq_len,)
+            "labels_mask": torch.Tensor,     # (seq_len,) response tokens=1
+        }
+```
+
+Alpaca 格式 prompt 模板：
+```
+Below is an instruction that describes a task.
+
+### Instruction:
+{instruction}
+
+### Response:
+{output}
 ```
 
 ---
 
-## 五、四个实验 + 泛化验证
+## 六、自动对比对构造
+
+### 6.1 三种生成器
+
+| 生成器 | 原理 | 适用场景 | 适用 Benchmark |
+|--------|------|---------|---------------|
+| `EntitySwapGenerator` | NER + 实体替换 | 事实知识 | TriviaQA, NQ |
+| `NumberPerturbGenerator` | 正则匹配 + 数字扰动 | 数学推理 | GSM8K, MATH |
+| `LLMGenerator` | 教师 LLM 自动生成最小改动变体 | 通用 | 任意 |
+
+所有生成器继承 `ContrastivePairGenerator` 基类：
+
+```python
+class ContrastivePairGenerator(ABC):
+    def generate(self, text: str) -> list[tuple[str, str]]: ...
+    def validate_pair(self, clean: str, corrupt: str) -> bool: ...
+    def batch_generate(self, texts: list[str], max_pairs_per_text: int = 3) -> list[tuple[str, str]]: ...
+```
+
+### 6.2 质量验证
+
+`ContrastivePairValidator` 确保每个对比对满足：
+1. **教师输出改变**：teacher 在 clean 和 corrupt 上的 top-1 预测不同
+2. **编辑距离小**：token 级别差异 ≤ 5
+3. **长度一致**：两个序列 token 数差 ≤ 2
+4. **因果效应存在**：teacher 残差流中存在非 trivial 的对比差值
+
+### 6.3 生成流程
+
+```
+大规模指令数据 → 三种生成器 → 候选对比对 → 质量验证 → 过滤后的对比对 JSON
+                                                              ↓
+                                                    GeneratedContrastiveDataset
+                                                              ↓
+                                                        RCID 训练
+```
+
+生成脚本：`scripts/generate_contrastive_pairs.py`
+
+---
+
+## 七、实验设计（五个实验）
 
 ### 实验 1：现有蒸馏方法保留了 teacher 的机制吗？
 
-**主线 A 的核心证据。**
+**主线 A 的核心证据。数据：IOI + Factual Probing。**
 
 ```
 1. 在 teacher 上搜索因果检查点（Read）
-2. 用 StandardKD、FitNets、InformedFitNets 各蒸馏一个 student（3 seeds）
-3. 对每个 student，在每个检查点做因果干预（Write）：
-   - Δ_T = logit_diff(original) - logit_diff(patched)   [teacher]
-   - Δ_S = 同上                                          [student, 用自己的 corrupt 值]
-   - causal_consistency = Pearson(Δ_T, Δ_S)
-4. 同时记录 task accuracy
-
-在 IOI + Factual Probing + WinoGrande 上运行。
+2. 用 StandardKD（全序列 KL）蒸馏 student（3 seeds）
+3. 对每个 student，在每个检查点做因果干预（Write）
+4. 计算 causal_consistency = Pearson(Δ_T, Δ_S)
 预期：student 准确率接近 teacher，但因果一致性低。
 ```
 
-### 实验 2：RCID 能否改善机制传递？
+### 实验 2：RCID 在受控环境下改善机制传递
 
-**主线 B 的核心证据——证明 RCID 优于现有方法。**
+**主线 B 的核心证据。数据：IOI + Factual Probing + WinoGrande。**
 
-4 种方法对比：
+4 种方法对比（均使用全序列 KL）：
 - StandardKD（只看输出）
 - FitNets（所有层匹配完整表示）
 - Informed FitNets（因果位置匹配完整表示）
 - RCID（因果位置匹配对比差值）
 
-评估指标：task accuracy、causal consistency、perplexity。
+评估指标：task accuracy、causal consistency、information purity。
 
 因素拆解：
 - FitNets → Informed FitNets = "选对位置"的贡献
 - Informed FitNets → RCID = "匹配对比差值"的贡献
 
-在 IOI + Factual Probing + WinoGrande 上运行。
+### 实验 3：大规模蒸馏 + RCID 正则（核心实用性实验）
 
-### 实验 3：机制一致性 vs 行为鲁棒性
-
-收集实验 1、2 中所有 student 的 (causal_consistency, ood_degradation)。
-
-OOD 变体：
-- IOI: 未见名字、不同句式、更长模板
-- Factual: 不同关系类型、不同实体领域
-- WinoGrande: 更长句子、多个干扰项
-
-如果正相关 → 保留 teacher 机制 → 更鲁棒的泛化。
-
-### 实验 4：对比差值的信息纯度
-
-对比 h^T（原始表示）和 d^T（对比差值）的信息纯度。
-
-在**未被修改的 token 位置**做测试。
-- task label：语义二分类
-- control label：模板编号或不相关属性
-- sklearn LogisticRegression, 80/20 split
-
-预期：d^T 的 selectivity > h^T 的 selectivity。
-
-### 实验 5（泛化验证）：LLaMA 3 跨架构复现
-
-**主线 C 的核心证据——方法不绑定于特定模型架构。**
+**主线 C 的核心证据。数据：Alpaca-52K + 自动对比对。**
 
 ```
-在 LLaMA-3-8B → LLaMA-3.2-1B 上重复实验 1 和实验 2 的核心部分：
-- 任务：IOI + Factual Probing（2 个任务即可，WinoGrande 可选）
-- 方法：StandardKD, RCID（2 个方法即可，完整消融可选）
-- Seeds：2-3 seeds
-- 评估：task accuracy + causal consistency
+方法对比：
+  standard_kd                  — 全序列 KL only
+  standard_kd_rcid             — KL + λ·RCID（对比差值匹配）
+  standard_kd_fitnets          — KL + FitNets（全层表示匹配）
+  standard_kd_informed_fitnets — KL + InformedFitNets（因果位置表示匹配）
 
-论文中呈现为：
-- 一张跨架构对比表（Table X）
-- 核心结论：RCID 在两种架构上均优于 StandardKD
+RCID 对比对：从 Alpaca 数据中自动构造 ~5K 对
+每 N 步从对比对数据中采样一个 batch 计算 RCID loss
+
+评估（真实 benchmark）：
+  MMLU (5-shot), GSM8K (8-shot), ARC-Challenge (25-shot),
+  HellaSwag, WinoGrande, TruthfulQA
+
+评估（可解释性，在对比对子集上）：
+  因果一致性, 信息纯度
+
+预期：RCID 正则在某些能力（特别是推理类）上带来提升
 ```
 
-资源估算：LLaMA 3 实验约 1.5 天（4 卡并行），因为只跑核心对比。
+### 实验 4：OOD 鲁棒性
+
+收集实验 2、3 中所有 student 的 (causal_consistency, ood_degradation)。
+
+- 在 Alpaca 上训练，在其他领域指令数据上评估性能衰减
+- 对比 Standard KD vs Standard KD + RCID 的 OOD degradation
+- 如果正相关 → 保留 teacher 机制 → 更鲁棒的泛化
+
+### 实验 5：机制分析 + 跨架构泛化
+
+**主线 D 的核心证据。**
+
+- 对实验 3 中大规模蒸馏的模型做因果分析（在对比对子集上计算因果一致性）
+- 证明 RCID 正则确实改善了内部机制对齐
+- 用信息纯度指标验证对比差值 vs 完整表示的优势
+
+**跨架构验证（LLaMA 3）**：在 LLaMA-3-8B → LLaMA-3.2-1B 上复现实验 2 核心部分（IOI + Factual Probing，StandardKD vs RCID）。
 
 ---
 
-## 六、核心模块实现规范
+## 八、核心模块实现规范
 
-### 6.1 模型适配器 (`models/adapter.py`)
+### 8.1 模型适配器 (`models/adapter.py`)
 
 ```python
 class Qwen3Adapter(ModelAdapter):
-    def get_layers(self, model: nn.Module) -> nn.ModuleList:
-        return model.model.layers
+    def get_layers(self, model): return model.model.layers
+    def get_residual_hook_point(self, model, layer_idx): return model.model.layers[layer_idx]
+    def parse_layer_output(self, output): return output[0]  # (batch, seq, d_model)
+    def get_embed_tokens(self, model): return model.model.embed_tokens
+    def get_lm_head(self, model): return model.lm_head
+    def get_num_layers(self, model): return len(model.model.layers)
+    def get_hidden_size(self, model): return model.config.hidden_size
 
-    def get_residual_hook_point(self, model: nn.Module, layer_idx: int) -> nn.Module:
-        return model.model.layers[layer_idx]
-
-    def parse_layer_output(self, output: tuple) -> torch.Tensor:
-        return output[0]  # (batch, seq, d_model)
-
-    def get_embed_tokens(self, model: nn.Module) -> nn.Embedding:
-        return model.model.embed_tokens
-
-    def get_lm_head(self, model: nn.Module) -> nn.Linear:
-        return model.lm_head
-
-    def get_num_layers(self, model: nn.Module) -> int:
-        return len(model.model.layers)
-
-    def get_hidden_size(self, model: nn.Module) -> int:
-        return model.config.hidden_size
-
-
-class LLaMA3Adapter(ModelAdapter):
-    """LLaMA 3 与 Qwen3 的 HF 接口几乎完全一致。"""
-
-    def get_layers(self, model: nn.Module) -> nn.ModuleList:
-        return model.model.layers
-
-    def get_residual_hook_point(self, model: nn.Module, layer_idx: int) -> nn.Module:
-        return model.model.layers[layer_idx]
-
-    def parse_layer_output(self, output: tuple) -> torch.Tensor:
-        return output[0]  # (batch, seq, d_model)
-
-    def get_embed_tokens(self, model: nn.Module) -> nn.Embedding:
-        return model.model.embed_tokens
-
-    def get_lm_head(self, model: nn.Module) -> nn.Linear:
-        return model.lm_head
-
-    def get_num_layers(self, model: nn.Module) -> int:
-        return len(model.model.layers)
-
-    def get_hidden_size(self, model: nn.Module) -> int:
-        return model.config.hidden_size
-
-
-def get_adapter(model_name: str) -> ModelAdapter:
-    """根据模型名自动选择 adapter。"""
-    name_lower = model_name.lower()
-    if "qwen" in name_lower:
-        return Qwen3Adapter()
-    elif "llama" in name_lower or "meta" in name_lower:
-        return LLaMA3Adapter()
-    else:
-        raise ValueError(f"Unknown model family: {model_name}")
+# LLaMA3Adapter 接口完全相同
 ```
 
-### 6.2 因果干预 (`circuit/intervention.py`)
+### 8.2 因果干预 (`circuit/intervention.py`)
 
 ```python
-def patch_and_run(
-    model: nn.Module,
-    adapter: ModelAdapter,
-    clean_input: torch.Tensor,       # (batch, seq_len)
-    patch_value: torch.Tensor,       # (batch, d_model)
-    layer: int,
-    token_pos: int,
-) -> torch.Tensor:                   # (batch, vocab_size)
+def patch_and_run(model, adapter, clean_input, patch_value, layer, token_pos):
     """Pearl do-operator in transformer residual stream."""
-    hook_point = adapter.get_residual_hook_point(model, layer)
+    # hook → patch → forward → unhook
 
-    def _patch_hook(module, input, output):
-        h = adapter.parse_layer_output(output).clone()
-        h[:, token_pos, :] = patch_value
-        # 重构 output tuple
-        return (h,) + output[1:]
-
-    handle = hook_point.register_forward_hook(_patch_hook)
-    try:
-        with torch.no_grad():
-            patched_logits = model(clean_input).logits
-    finally:
-        handle.remove()
-    return patched_logits
-
-
-def compute_causal_effect(
-    model: nn.Module,
-    adapter: ModelAdapter,
-    clean_input: torch.Tensor,
-    corrupt_input: torch.Tensor,
-    layer: int,
-    token_pos: int,
-    answer_pos: int,
-    correct_token_id: torch.Tensor,
-    wrong_token_id: torch.Tensor,
-) -> torch.Tensor:  # (batch,)
+def compute_causal_effect(model, adapter, clean_input, corrupt_input,
+                          layer, token_pos, answer_pos, correct_id, wrong_id):
     """Δ = logit_diff(original) - logit_diff(patched)"""
-    model.eval()
-
-    with torch.no_grad():
-        orig_logits = model(clean_input).logits[:, answer_pos, :]
-    orig_diff = (
-        orig_logits.gather(1, correct_token_id.unsqueeze(1))
-        - orig_logits.gather(1, wrong_token_id.unsqueeze(1))
-    ).squeeze(1)  # (batch,)
-
-    # 获取 corrupt 值
-    corrupt_cache = {}
-    hook_point = adapter.get_residual_hook_point(model, layer)
-    handle = hook_point.register_forward_hook(
-        lambda mod, inp, out, s=corrupt_cache:
-            s.update({"h": adapter.parse_layer_output(out)[:, token_pos, :].clone()})
-    )
-    with torch.no_grad():
-        model(corrupt_input)
-    handle.remove()
-
-    patched_logits = patch_and_run(
-        model, adapter, clean_input, corrupt_cache["h"], layer, token_pos
-    )[:, answer_pos, :]
-    patched_diff = (
-        patched_logits.gather(1, correct_token_id.unsqueeze(1))
-        - patched_logits.gather(1, wrong_token_id.unsqueeze(1))
-    ).squeeze(1)
-
-    return orig_diff - patched_diff
 ```
 
-### 6.3 因果一致性评估 (`eval/causal_consistency.py`)
-
-```python
-class CausalConsistencyEvaluator:
-    def evaluate(
-        self,
-        teacher: nn.Module,
-        student: nn.Module,
-        teacher_adapter: ModelAdapter,
-        student_adapter: ModelAdapter,
-        dataset: ContrastiveDataset,
-        checkpoints: list[tuple[int, int]],
-        layer_mapping: dict[int, int],
-    ) -> dict:
-        results = {}
-        for (t_layer, t_pos) in checkpoints:
-            s_layer = layer_mapping[t_layer]
-            delta_T = compute_causal_effect(
-                teacher, teacher_adapter, ...)
-            delta_S = compute_causal_effect(
-                student, student_adapter, ..., layer=s_layer)
-            r, p = scipy.stats.pearsonr(
-                delta_T.cpu().numpy(), delta_S.cpu().numpy())
-            results[(t_layer, t_pos)] = {"correlation": r, "p_value": p}
-        return results
-```
-
-### 6.4 Procrustes 对齐 (`alignment/procrustes.py`)
-
-```python
-def procrustes_align(
-    source: torch.Tensor,   # (N, d_S)  — student dim
-    target: torch.Tensor,   # (N, d_T)  — teacher dim
-) -> torch.Tensor:          # (d_T, d_S)
-    """W* = argmin ||target - source @ W^T||_F"""
-    eps = 1e-8
-    source_c = source - source.mean(dim=0, keepdim=True)
-    target_c = target - target.mean(dim=0, keepdim=True)
-    source_c = source_c / source_c.norm(dim=-1, keepdim=True).clamp(min=eps)
-    target_c = target_c / target_c.norm(dim=-1, keepdim=True).clamp(min=eps)
-
-    M = target_c.T @ source_c  # (d_T, d_S)
-    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-    W = U @ Vh  # (d_T, d_S)
-    return W
-```
-
-**Procrustes 维度适配**：
-- Qwen3: W shape = (4096, 1024)
-- LLaMA 3: W shape = (4096, 2048)
-
-### 6.5 RCID 损失 (`distillation/rcid_loss.py`)
+### 8.3 RCID 损失 (`distillation/rcid_loss.py`)
 
 ```python
 class RCIDLoss(nn.Module):
-    """在因果检查点匹配 teacher 和 student 的对比差值方向。
-
+    """因果检查点上匹配 teacher/student 对比差值方向。
     W: buffer, 冻结 Procrustes 矩阵 (d_T, d_S)
     教师痕迹: 预计算, detached
     学生前向: 保留梯度
     """
-    def __init__(self, checkpoints, layer_mapping, W_matrices):
-        super().__init__()
-        self.checkpoints = checkpoints
-        self.layer_mapping = layer_mapping
-        for t_layer, W in W_matrices.items():
-            self.register_buffer(f"W_{t_layer}", W)
-
-    def forward(
-        self,
-        teacher_imprints: dict[tuple[int, int], torch.Tensor],
-        student_clean_residuals: dict[int, torch.Tensor],
-        student_corrupt_residuals: dict[int, torch.Tensor],
-    ) -> torch.Tensor:
-        eps = 1e-8
-        total = torch.tensor(0.0, device=next(iter(teacher_imprints.values())).device)
-
-        for (t_layer, t_pos) in self.checkpoints:
-            s_layer = self.layer_mapping[t_layer]
-            W = getattr(self, f"W_{t_layer}")
-
-            d_T = teacher_imprints[(t_layer, t_pos)]      # (batch, d_T), no grad
-            d_S = (student_clean_residuals[s_layer][:, t_pos, :]
-                   - student_corrupt_residuals[s_layer][:, t_pos, :])  # (batch, d_S), has grad
-
-            aligned = d_S @ W.T                             # (batch, d_T)
-            aligned_n = aligned / aligned.norm(dim=-1, keepdim=True).clamp(min=eps)
-            d_T_n = d_T / d_T.norm(dim=-1, keepdim=True).clamp(min=eps)
-
-            total = total + (aligned_n - d_T_n).pow(2).sum(dim=-1).mean()
-
-        total = total / len(self.checkpoints)
-        assert total.isfinite(), f"RCID loss is {total.item()}"
-        return total
+    def forward(self, teacher_imprints, student_clean_residuals, student_corrupt_residuals):
+        # 对每个 checkpoint: d_S = h_clean - h_corrupt, aligned = d_S @ W.T
+        # loss = ||normalize(aligned) - normalize(d_T)||^2
 ```
 
-### 6.6 Informed FitNets (`distillation/baselines.py`)
+### 8.4 大规模蒸馏训练器 (`distillation/scalable_trainer.py`)
 
 ```python
-class InformedFitNetsLoss(nn.Module):
-    """与 RCID 共享 checkpoints 和 W，匹配 h^T_clean 而非 d^T。
+class ScalableDistillationTrainer:
+    """双数据流训练器：全序列 KL + 可选 RCID 正则。
 
-    消融基线：拆解 RCID 的优势来自"选对位置"还是"匹配对比差值"。
+    主数据流: InstructionDataset → 全序列 KL 蒸馏
+    RCID 数据流: GeneratedContrastiveDataset → 因果差值匹配（每 N 步）
+
+    方法路由:
+      standard_kd              → 无对比对, lambda=0       → 纯 KL
+      standard_kd_rcid         → 对比对 + checkpoints     → KL + RCID
+      standard_kd_fitnets      → 对比对 + 全层 W          → KL + FitNets
+      standard_kd_informed_fitnets → 对比对 + checkpoints + W → KL + InformedFitNets
     """
-    ...
+    def train(self) -> dict[str, list[float]]:
+        for epoch:
+            for step, main_batch in main_loader:
+                kl_loss = kd_loss_fn(t_logits, s_logits, mask=attn_mask)
+                rcid_loss = 0
+                if use_rcid and step % rcid_every == 0:
+                    rcid_loss = _compute_rcid_loss(next(rcid_iter))
+                total = kl_loss + lambda_rcid * rcid_loss
+                total.backward(); optimizer.step(); scheduler.step()
+```
+
+支持 fp16 (torch.amp.autocast + GradScaler)、gradient accumulation、cosine scheduler with warmup。
+
+### 8.5 Toy Data 训练器 (`distillation/trainer.py`)
+
+```python
+class UnifiedTrainer:
+    """用于 toy data 实验（IOI/Factual/WinoGrande）的训练器。
+    支持 standard_kd, fitnets, informed_fitnets, rcid 四种方法。
+    KL 模式由 config["kl_mode"] 控制，默认 "sequence"。
+    接受可选的 tokenizer 参数用于生成 attention mask。
+    """
+```
+
+### 8.6 Procrustes 对齐 (`alignment/procrustes.py`)
+
+```python
+def procrustes_align(source, target) -> torch.Tensor:
+    """W* = argmin ||target - source @ W^T||_F
+    source: (N, d_S), target: (N, d_T) → W: (d_T, d_S)"""
 ```
 
 ---
 
-## 七、项目结构
+## 九、项目结构
 
 ```
 rcid/
@@ -605,27 +520,28 @@ rcid/
 ├── pyproject.toml
 ├── configs/
 │   ├── master.yaml
-│   ├── qwen3.yaml                      # Qwen3 模型特定配置
-│   ├── llama3.yaml                     # LLaMA 3 模型特定配置
+│   ├── qwen3.yaml
+│   ├── llama3.yaml
+│   ├── large_scale.yaml                    # 大规模蒸馏配置
 │   ├── exp1_mechanism_preservation.yaml
 │   ├── exp2_rcid_comparison.yaml
 │   ├── exp3_robustness_correlation.yaml
 │   ├── exp4_information_purity.yaml
-│   └── exp5_cross_architecture.yaml    # 新增：跨架构泛化
+│   └── exp5_cross_architecture.yaml
 ├── src/
 │   └── rcid/
 │       ├── __init__.py
 │       ├── models/
 │       │   ├── __init__.py
-│       │   ├── adapter.py              # ModelAdapter 基类 + Qwen3Adapter + LLaMA3Adapter
-│       │   ├── teacher.py              # 加载 teacher（自动识别模型族）
-│       │   └── student.py              # 加载 student（自动识别模型族）
+│       │   ├── adapter.py                  # ModelAdapter 基类 + Qwen3Adapter + LLaMA3Adapter
+│       │   ├── teacher.py
+│       │   └── student.py
 │       ├── circuit/
 │       │   ├── __init__.py
-│       │   ├── patching.py             # Read: extract_contrastive_differences
-│       │   ├── intervention.py         # Write: patch_and_run, compute_causal_effect
-│       │   ├── checkpoint_selection.py # 多样性约束检查点选择
-│       │   └── contrastive.py          # ContrastiveDataset 基类
+│       │   ├── patching.py                 # Read: extract_contrastive_differences
+│       │   ├── intervention.py             # Write: patch_and_run, compute_causal_effect
+│       │   ├── checkpoint_selection.py
+│       │   └── contrastive.py              # ContrastiveDataset 基类
 │       ├── alignment/
 │       │   ├── __init__.py
 │       │   ├── procrustes.py
@@ -633,15 +549,20 @@ rcid/
 │       │   └── cka.py
 │       ├── distillation/
 │       │   ├── __init__.py
-│       │   ├── rcid_loss.py
-│       │   ├── trainer.py
-│       │   └── baselines.py            # StandardKD, FitNets, InformedFitNets
+│       │   ├── rcid_loss.py                # RCID loss
+│       │   ├── baselines.py                # StandardKDLoss (全序列KL), FitNets, InformedFitNets
+│       │   ├── trainer.py                  # UnifiedTrainer (toy data 实验)
+│       │   └── scalable_trainer.py         # ScalableDistillationTrainer (大规模蒸馏)
 │       ├── data/
 │       │   ├── __init__.py
 │       │   ├── ioi.py
 │       │   ├── factual_probing.py
 │       │   ├── winogrande.py
-│       │   └── simple_math.py          # 可选
+│       │   ├── simple_math.py
+│       │   ├── instruction_dataset.py      # 大规模指令数据加载 (Alpaca/SlimOrca)
+│       │   ├── contrastive_generators.py   # 三种自动对比对生成器
+│       │   ├── contrastive_validator.py    # 对比对质量验证
+│       │   └── generated_contrastive.py    # 从 JSON 加载自动生成的对比对
 │       ├── eval/
 │       │   ├── __init__.py
 │       │   ├── causal_consistency.py
@@ -653,20 +574,27 @@ rcid/
 │           ├── __init__.py
 │           └── paper_figures.py
 ├── scripts/
-│   ├── pilot_validation.py             # 快速验证（Qwen3 + LLaMA 3 各自独立验证）
+│   ├── pilot_validation.py
 │   ├── run_exp1.py
 │   ├── run_exp2.py
-│   ├── run_exp3.py
+│   ├── run_exp3.py                         # OOD 鲁棒性相关性
 │   ├── run_exp4.py
-│   ├── run_exp5_cross_arch.py          # 新增：LLaMA 3 泛化实验
-│   └── run_all.py
+│   ├── run_exp5_cross_arch.py
+│   ├── run_all.py
+│   ├── generate_contrastive_pairs.py       # 从大规模数据生成对比对
+│   ├── run_large_scale_distill.py          # 大规模蒸馏实验 (实验 3)
+│   ├── eval_benchmarks.py                  # Benchmark 评估 (MMLU/GSM8K/ARC 等)
+│   ├── run_full_pipeline.sh                # 一键运行完整大规模蒸馏流程
+│   └── check_environment.py                # 环境依赖检查
 ├── tests/
+│   ├── conftest.py                         # TinyTransformerModel, TinyAdapter
 │   ├── test_models.py
 │   ├── test_data.py
 │   ├── test_circuit.py
 │   ├── test_alignment.py
 │   ├── test_distillation.py
 │   ├── test_eval.py
+│   ├── test_large_scale.py                 # 大规模蒸馏集成测试
 │   └── test_integration.py
 └── outputs/
     └── results/
@@ -674,14 +602,15 @@ rcid/
         ├── exp2/
         ├── exp3/
         ├── exp4/
-        └── exp5_cross_arch/            # 新增
+        ├── exp5_cross_arch/
+        └── large_scale/                    # 大规模蒸馏结果
 ```
 
 ---
 
-## 八、实验配置
+## 十、实验配置
 
-### 8.1 模型
+### 10.1 模型
 
 ```yaml
 # 主实验
@@ -707,112 +636,119 @@ llama3_student:
   d_model: 2048
 ```
 
-### 8.2 实验矩阵
+### 10.2 实验矩阵
 
 ```yaml
-# 主实验 (Qwen3)
+# Toy data 实验 (Qwen3) — 实验 1+2
 methods: [standard_kd, fitnets, informed_fitnets, rcid]
-tasks:
-  validation: ioi
-  primary: [factual_probing, winogrande]
+tasks: [ioi, factual_probing, winogrande]
 seeds: [42, 123, 456]
+# 4 methods × 3 tasks × 3 seeds = 36 runs
 
-# 核心: 4 methods × 3 tasks × 3 seeds = 36 runs
-# 每 run 约 4-6 小时 (A100)
-# 4 卡并行 → 约 9 轮 → 2-3 天
+# 大规模蒸馏 (Qwen3) — 实验 3
+large_scale_methods: [standard_kd, standard_kd_rcid, standard_kd_fitnets, standard_kd_informed_fitnets]
+large_scale_data: [alpaca_52k]
+lambda_rcid_search: [0.01, 0.05, 0.1, 0.5, 1.0]
+seeds: [42, 123, 456]
+# 先跑 lambda=0.1 的 standard_kd vs standard_kd_rcid，再展开
 
-# 泛化验证 (LLaMA 3)
-llama3_methods: [standard_kd, rcid]                # 只需对比核心方法
-llama3_tasks: [ioi, factual_probing]               # 2 个任务
+# 泛化验证 (LLaMA 3) — 实验 5
+llama3_methods: [standard_kd, rcid]
+llama3_tasks: [ioi, factual_probing]
 llama3_seeds: [42, 123, 456]
-
-# 泛化: 2 methods × 2 tasks × 3 seeds = 12 runs
-# 4 卡并行 → 约 3 轮 → 1-1.5 天
+# 2 × 2 × 3 = 12 runs
 ```
 
-### 8.3 训练超参数
+### 10.3 Toy Data 训练超参数
 
 ```yaml
-training:
+toy_training:
   epochs: 20
-  batch_size: 16        # A100 80GB 足够
+  batch_size: 16
   lr: 5e-5
   optimizer: adamw
   scheduler: cosine
   grad_clip: 1.0
   lambda_kl: 1.0
   lambda_rcid: 1.0
-  fp16: true            # 减少显存，加速训练
+  kl_mode: sequence
+  temperature: 2.0
+  fp16: true
 ```
 
-### 8.4 多 GPU 策略
+### 10.4 大规模蒸馏超参数
+
+```yaml
+large_scale_training:
+  epochs: 3
+  batch_size: 8                      # per GPU
+  gradient_accumulation_steps: 4     # effective batch = 32
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  max_seq_len: 512
+  kl_mode: sequence
+  temperature: 2.0
+  lambda_rcid: 0.1                   # grid search: [0.01, 0.05, 0.1, 0.5, 1.0]
+  rcid_every_n_steps: 5
+  rcid_data_size: 5000
+  fp16: true
+  save_every_n_epochs: 1
+```
+
+### 10.5 多 GPU 策略
 
 ```yaml
 # 不做分布式训练（模型不需要），而是做实验级并行
-# Qwen3 主实验
-gpu_0: seed=42, method=standard_kd → method=fitnets → ...
-gpu_1: seed=42, method=informed_fitnets → method=rcid → ...
+# Toy data (Qwen3)
+gpu_0: seed=42, method=standard_kd → fitnets → ...
+gpu_1: seed=42, method=informed_fitnets → rcid → ...
 gpu_2: seed=123, ...
 gpu_3: seed=456, ...
 
-# LLaMA 3 泛化实验（主实验完成后运行）
-gpu_0: seed=42, method=standard_kd
-gpu_1: seed=42, method=rcid
-gpu_2: seed=123, method=standard_kd + rcid
-gpu_3: seed=456, method=standard_kd + rcid
+# 大规模蒸馏 (Qwen3)
+gpu_0: standard_kd, seed=42
+gpu_1: standard_kd_rcid (lambda=0.1), seed=42
+gpu_2: standard_kd_rcid (lambda=0.05), seed=42
+gpu_3: standard_kd_rcid (lambda=0.5), seed=42
 ```
 
 ---
 
-## 九、Pilot Validation（最先运行！）
-
-在写完整代码之前，必须**分别**对两种模型族跑验证：
+## 十一、Pilot Validation（最先运行！）
 
 ```python
 # scripts/pilot_validation.py
 # 参数: --model_family qwen3 | llama3
 # 目标：每种模型 30 分钟内完成
 
-# 1. 加载 teacher，在 IOI 上测试准确率
-#    预期：> 95%。如果不行 → IOI 模板需要适配
-
-# 2. 用对应 tokenizer 检查名字池，输出单 token 名字列表
-#    预期：至少 20 个可用名字
-
-# 3. 构造 10 个 IOI 对比对，提取各层因果差值范数
-#    预期：存在明显的层间差异，高层范数 > 底层
-#    如果全部接近 0 → 方法不适用于该架构
-
-# 4. 在一个检查点做 activation patching，计算因果效应
-#    预期：某些位置 Δ > 0 且显著
-#    如果所有位置 Δ ≈ 0 → patching 在该架构上无效
-
-# 5. 加载 student（未蒸馏），在 IOI 上测试 baseline 准确率
-#    评估 student 容量
+# 1. 加载 teacher，在 IOI 上测试准确率 → 预期 > 95%
+# 2. 用对应 tokenizer 检查名字池 → 预期 ≥ 20 个单 token 名字
+# 3. 构造 10 个 IOI 对比对，提取各层因果差值范数 → 预期高层 > 底层
+# 4. 在一个检查点做 activation patching → 预期 Δ > 0 且显著
+# 5. 加载 student（未蒸馏），测试 baseline 准确率
 ```
-
-**如果任何一种架构在第 2-4 步失败，该架构不能用于实验。**
-**Qwen3 必须全部通过（主实验）。LLaMA 3 如果失败，退回单架构方案。**
 
 ---
 
-## 十、编码规范
+## 十二、编码规范
 
-### 10.1 类型标注（强制）
+### 12.1 类型标注（强制）
 所有函数签名完整标注。
 
-### 10.2 Tensor Shape 注释（强制）
+### 12.2 Tensor Shape 注释（强制）
 ```python
 residual = adapter.parse_layer_output(output)[:, token_pos, :]  # (batch, d_model)
 ```
 
-### 10.3 断言检查
+### 12.3 断言检查
 ```python
 assert teacher_imprint.dim() == 2, f"Expected 2D, got {teacher_imprint.dim()}D"
 assert loss.isfinite(), f"Loss is {loss.item()}"
 ```
 
-### 10.4 Hook 生命周期管理
+### 12.4 Hook 生命周期管理
 ```python
 handle = hook_point.register_forward_hook(hook_fn)
 try:
@@ -821,80 +757,111 @@ finally:
     handle.remove()
 ```
 
-### 10.5 梯度流管理
+### 12.5 梯度流管理
 - 教师模型：始终 eval + no_grad
 - 教师痕迹：预计算后 detach
 - W 矩阵：注册为 buffer
 - 学生前向传播：保留梯度
 
-### 10.6 数值稳定性
+### 12.6 数值稳定性
 ```python
 eps = 1e-8
 norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
 ```
 
-### 10.7 不硬编码架构
-所有模型交互必须通过 ModelAdapter，禁止直接写 `model.transformer.h[l]` 或 `model.model.layers[l]`（除 adapter 内部实现外）。
+### 12.7 不硬编码架构
+所有模型交互通过 ModelAdapter，禁止直接写 `model.model.layers[l]`（除 adapter 内部外）。
 
-### 10.8 文件长度
+### 12.8 文件长度
 每个 `.py` 不超过 300 行。
 
-### 10.9 模型族参数化
-任何涉及模型名、层数、维度的地方都应从 config 读取或通过 adapter 查询，不硬编码。
+### 12.9 模型族参数化
+涉及模型名、层数、维度的地方从 config 读取或通过 adapter 查询。
 数据集类接受 tokenizer 参数，不假设特定词表。
 
 ---
 
-## 十一、相关工作定位
+## 十三、相关工作定位
 
 **vs Wu et al. (2022) Causal Distillation (DIITO)**：
-DIITO 用 interchange intervention（替换为另一个输入的值）+ 预定义因果模型。
-RCID 用 activation patching（替换为 corrupt 版本的值）+ 自动检查点搜索。
-RCID 不需要预先知道 teacher 的因果结构。
+DIITO 用 interchange intervention + 预定义因果模型。
+RCID 用 activation patching + 自动检查点搜索。RCID 不需要预先知道 teacher 的因果结构。
 
 **vs Prakash et al. (2025) Circuit Distillation**：
 他们用 CKA 匹配电路组件的完整激活。
 我们用 Procrustes 匹配对比差值（过滤了任务无关信息）。
+他们只在 toy task 上验证；我们扩展到大规模蒸馏 + 真实 benchmark。
 
 **vs Dunefsky et al. (2025) Distilled Circuits**：
-纯分析工作。我们既诊断（实验 1）又治疗（RCID）。
+纯分析工作。我们既诊断（实验 1）又治疗（RCID），且验证实用性（实验 3）。
+
+**vs 标准蒸馏方法（DistilBERT、TinyBERT、MiniLM）**：
+它们只做输出/表示匹配。RCID 额外对齐因果机制，作为正则项互补。
 
 ---
 
-## 十二、实施优先级
+## 十四、实施优先级
 
 ```
-P0（阻塞一切）:
-  Pilot validation（Qwen3 + LLaMA 3 分别运行）
-  ModelAdapter 抽象层（含 Qwen3Adapter + LLaMA3Adapter）
-  IOI 数据集 + 双 tokenizer 验证
+P0（基础修复 — 已完成 ✅）:
+  ✅ 修复 StandardKDLoss → 全序列 KL + mask 支持
+  ✅ 修复 UnifiedTrainer → kl_mode 配置 + tokenizer 参数
+  ✅ 实现 ScalableDistillationTrainer
+  ✅ 实现 InstructionDataset、GeneratedContrastiveDataset
+  ✅ 实现 contrastive_generators + contrastive_validator
+  ✅ 实现 run_large_scale_distill.py + eval_benchmarks.py + generate_contrastive_pairs.py
 
-P1（核心实验 — Qwen3）:
-  intervention.py + causal_consistency.py
-  检查点选择（多样性约束）
-  所有蒸馏损失 + trainer
-  运行实验 1 + 2（IOI 先行，然后扩展到真实任务）
+P1（Toy data 实验验证 — 当前阶段）:
+  Pilot validation（Qwen3 + LLaMA 3）
+  重跑 toy data（验证全序列 KL 下 RCID 仍有效）
+  运行实验 1 + 2（IOI 先行，扩展到 Factual + WinoGrande）
 
-P2（完善论文 — Qwen3）:
-  Factual Probing + WinoGrande 数据集
-  OOD Robustness 评估
-  Information Purity Test
-  运行实验 3 + 4
+P2（大规模蒸馏实验运行）:
+  从 Alpaca 生成 ~5K 对比对
+  Standard KD 基线 on Alpaca-52K
+  Standard KD + RCID on Alpaca-52K
+  λ_RCID 超参数搜索：[0.01, 0.05, 0.1, 0.5, 1.0]
+  MMLU/GSM8K/ARC/HellaSwag/WinoGrande/TruthfulQA 评估
 
-P3（跨架构泛化 — LLaMA 3）:
-  LLaMA 3 数据集适配（名字池、模板验证）
-  运行实验 5（exp1 + exp2 核心部分的 LLaMA 3 复现）
+P3（完善论文 — Qwen3）:
+  OOD 鲁棒性实验
+  因果分析（大规模蒸馏模型）
+  信息纯度验证
+
+P4（跨架构泛化 — LLaMA 3）:
+  LLaMA 3 数据集适配
+  实验 2 核心部分复现（IOI + Factual）
   跨架构对比表
 
-P4（论文材料）:
-  论文图表
-  结果分析
-  跨架构讨论章节
+P5（论文材料）:
+  论文图表、结果分析、讨论章节
 ```
 
 ---
 
-## 十三、符号速查
+## 十五、风险与应对
+
+### 风险 1：RCID 在大规模蒸馏上无提升
+**应对**：
+- λ_RCID grid search [0.01, 1.0]
+- 分能力维度分析（可能在数学推理有效、其他无效 → 仍是有趣发现）
+- 即使性能提升不大，因果一致性提升 + 可解释性仍有价值
+
+### 风险 2：自动对比对质量不够
+**应对**：
+- 严格质量验证 pipeline (ContrastivePairValidator)
+- 回退到半自动（基于 benchmark 结构化构造）
+- GSM8K/ARC 等本身有结构化格式，易做最小改动
+
+### 风险 3：计算资源不够
+**应对**：
+- 先用 Alpaca-52K（小数据）快速验证
+- fp16 + gradient checkpointing
+- RCID 正则只需少量对比对，不显著增加计算
+
+---
+
+## 十六、符号速查
 
 | 符号 | 含义 | 代码 |
 |------|------|------|
@@ -906,10 +873,11 @@ P4（论文材料）:
 | $\Delta_T$ | teacher patching 后行为变化 | `delta_T` |
 | $\Delta_S$ | student patching 后行为变化 | `delta_S` |
 | CC | 因果一致性 | `causal_consistency` |
+| $\lambda$ | RCID 正则权重 | `lambda_rcid` |
 
 ---
 
-## 十四、依赖
+## 十七、依赖
 
 ```toml
 [project]
@@ -917,8 +885,8 @@ name = "rcid"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
-    "transformers>=4.45",    # Qwen3 + LLaMA 3 支持
-    "accelerate>=0.27",      # 模型加载
+    "transformers>=4.45",
+    "accelerate>=0.27",
     "datasets>=2.16",
     "omegaconf>=2.3",
     "wandb>=0.16",
@@ -929,72 +897,49 @@ dependencies = [
     "pytest>=7.4",
     "tqdm>=4.66",
 ]
+
+[project.optional-dependencies]
+eval = ["lm-eval>=0.4"]  # EleutherAI lm-evaluation-harness
 ```
 
 ---
 
-## 十五、论文结构映射
+## 十八、论文结构映射
 
 ```
 Section 1: Introduction
-  → 主线 A + B + C 叙事
+  → 四条主线叙事：发现问题 → 解决方法 → 实用验证 → 跨架构泛化
 
-Section 2: Mechanistic Consistency Metric
-  → 2.1-2.2（Read/Write + 因果一致性）
+Section 2: Background & Mechanistic Consistency Metric
+  → 2.1-2.2（Read/Write + 因果一致性指标）
 
 Section 3: Method (RCID)
-  → 2.3-2.4 + 6.1-6.5（损失、检查点选择、对齐）
+  → 2.3-2.4（RCID 损失 + 检查点选择 + Procrustes 对齐）
+  → 6.1-6.3（自动对比对构造）
 
 Section 4: Experiments
-  4.1 Setup: 两个模型族、三个任务、四个方法
-  4.2 Exp1: 现有方法机制不一致（Qwen3 主表）
-  4.3 Exp2: RCID 改善 + 因素拆解（Qwen3 主表）
-  4.4 Exp3: 一致性 vs 鲁棒性散点图
-  4.5 Exp4: 信息纯度
-  4.6 Exp5: 跨架构泛化（LLaMA 3 验证表）
+  4.1 Setup: 两个模型族、toy data + 大规模数据
+  4.2 Exp1: 现有方法机制不一致
+  4.3 Exp2: RCID 改善机制传递（toy data，因素拆解）
+  4.4 Exp3: 大规模蒸馏 + RCID 正则（核心实用性结果）
+  4.5 Exp4: OOD 鲁棒性
+  4.6 Exp5: 因果分析 + 跨架构泛化（LLaMA 3）
 
 Section 5: Discussion
-  → 跨架构讨论、MoE 未来方向、局限性
+  → 贡献总结、局限性、未来方向（MoE、更大规模）
+
+Appendix:
+  → 自动对比对构造细节
+  → 超参数搜索
+  → 更多可视化
 ```
 
 ---
 
-## 十六、大规模蒸馏扩展
+## 十九、贡献列表
 
-### 16.1 新增实验：大规模蒸馏 + RCID 正则
-
-RCID 作为即插即用正则项嫁接到标准大规模 KL 蒸馏上：
-
-$$\mathcal{L} = \mathcal{L}_{\text{KL}}^{\text{seq-level}} + \lambda \cdot \mathcal{L}_{\text{RCID}}$$
-
-- 主损失：在 Alpaca-52K 上做全序列 KL 蒸馏
-- RCID 正则：在自动构造的 ~5K 对比对上做因果差值匹配
-- 评估：MMLU, GSM8K, ARC, HellaSwag, WinoGrande, TruthfulQA
-
-### 16.2 KL Loss 修正
-
-所有蒸馏方法使用全序列 per-token KL（与主流一致），不再仅在 answer_pos 计算。
-配置项 `kl_mode: "sequence" | "answer_only"`
-
-### 16.3 自动对比对构造
-
-三种生成器：
-- `EntitySwapGenerator`：实体替换（事实知识）
-- `NumberPerturbGenerator`：数字扰动（数学推理）
-- `LLMGenerator`：教师自动生成（通用）
-
-质量验证：`ContrastivePairValidator` 确保改动最小且 teacher 输出确实改变
-
-### 16.4 新增文件
-
-```
-src/rcid/data/contrastive_generators.py    # 三种自动对比对生成器
-src/rcid/data/contrastive_validator.py     # 质量验证
-src/rcid/data/generated_contrastive.py     # 从 JSON 加载对比对的 Dataset
-src/rcid/data/instruction_dataset.py       # 大规模指令数据加载
-src/rcid/distillation/scalable_trainer.py  # 大规模蒸馏训练器
-scripts/generate_contrastive_pairs.py      # 生成对比对脚本
-scripts/run_large_scale_distill.py         # 大规模蒸馏实验
-scripts/eval_benchmarks.py                 # Benchmark 评估
-configs/large_scale.yaml                   # 配置
-```
+1. **Mechanistic Consistency Metric**：首次提出量化蒸馏中推理机制保留程度的指标
+2. **RCID Loss**：基于因果差值的机制对齐正则项，可即插即用到标准蒸馏流程
+3. **自动对比对构造**：通过实体替换、数字扰动、LLM 生成三种方式使方法可扩展到大规模数据
+4. **双重验证**：在 toy data 上验证可解释性（因果一致性、信息纯度），在大规模 benchmark 上验证实用性（MMLU、GSM8K、ARC）
+5. **跨架构泛化**：在 Qwen3 和 LLaMA 3 两种架构上验证方法有效性

@@ -4,15 +4,30 @@ Bridge between ``scripts/generate_contrastive_pairs.py`` (which produces
 JSON files) and the RCID training pipeline (which consumes
 ``ContrastiveDataset`` objects).
 
+Supports two JSON formats:
+
+1. **Legacy (bare list)**: ``[{"clean": ..., "corrupt": ...}, ...]``
+2. **Per-task envelope**: ``{"task_type": ..., "pairs": [...], ...}``
+
 Usage::
 
-    from rcid.data.generated_contrastive import GeneratedContrastiveDataset
-
-    dataset = GeneratedContrastiveDataset(
+    # Single file (legacy or envelope)
+    ds = GeneratedContrastiveDataset(
         json_path="data/contrastive_pairs.json",
-        tokenizer=tokenizer,
-        teacher=teacher,
-        max_seq_len=256,
+        tokenizer=tokenizer, teacher=teacher,
+    )
+
+    # Directory of per-task JSONs
+    ds = GeneratedContrastiveDataset.from_directory(
+        "data/contrastive_pairs/",
+        tokenizer=tokenizer, teacher=teacher,
+        task_types=["entity_swap", "number_perturb"],
+    )
+
+    # Multiple explicit files
+    ds = GeneratedContrastiveDataset.from_multiple_files(
+        ["data/entity_swap.json", "data/number_perturb.json"],
+        tokenizer=tokenizer, teacher=teacher,
     )
 """
 
@@ -31,17 +46,42 @@ from rcid.circuit.contrastive import ContrastiveDataset
 logger = logging.getLogger(__name__)
 
 
-class GeneratedContrastiveDataset(ContrastiveDataset):
-    """ContrastiveDataset built from a JSON file of auto-generated pairs.
+def _load_pairs_from_json(path: Path) -> list[dict[str, Any]]:
+    """Load pairs from a JSON file, handling both envelope and bare-list."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    The JSON file is expected to contain a list of dicts, each with at least
-    ``clean`` and ``corrupt`` text fields (as produced by
-    ``generate_contrastive_pairs.py``).
+    if isinstance(data, list):
+        # Legacy bare-list format
+        logger.info("Loaded %d pairs from %s (bare-list format)", len(data), path)
+        return data
+    elif isinstance(data, dict) and "pairs" in data:
+        # Per-task envelope format
+        pairs = data["pairs"]
+        task_type = data.get("task_type", "unknown")
+        logger.info(
+            "Loaded %d pairs from %s (envelope: task_type=%s)",
+            len(pairs), path, task_type,
+        )
+        return pairs
+    else:
+        raise ValueError(
+            f"Unrecognised JSON format in {path}. "
+            "Expected a list of dicts or a dict with a 'pairs' key."
+        )
+
+
+class GeneratedContrastiveDataset(ContrastiveDataset):
+    """ContrastiveDataset built from auto-generated contrastive pairs.
+
+    Accepts a single JSON file (legacy bare-list or per-task envelope), or
+    use the ``from_directory`` / ``from_multiple_files`` classmethods to
+    merge multiple per-task files.
 
     Parameters
     ----------
     json_path : str | Path
-        Path to the JSON file.
+        Path to a single JSON file.
     tokenizer : Any
         HuggingFace tokenizer (must support ``__call__`` with
         ``return_tensors="pt"``).
@@ -69,9 +109,7 @@ class GeneratedContrastiveDataset(ContrastiveDataset):
         model_family: str = "auto",
     ) -> None:
         # ── Load & filter JSON ───────────────────────────────────────
-        with open(json_path, "r", encoding="utf-8") as f:
-            raw: list[dict[str, Any]] = json.load(f)
-        logger.info("Loaded %d raw pairs from %s", len(raw), json_path)
+        raw = _load_pairs_from_json(Path(json_path))
 
         if source_filter is not None:
             allowed = {source_filter} if isinstance(source_filter, str) else set(source_filter)
@@ -228,3 +266,139 @@ class GeneratedContrastiveDataset(ContrastiveDataset):
             wrong[start:end] = x_at_ans.argmax(dim=-1).cpu()
 
         return correct, wrong
+
+    # ------------------------------------------------------------------
+    # Classmethods for multi-file loading
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _from_pairs(
+        cls,
+        pairs: list[dict[str, Any]],
+        tokenizer: Any,
+        teacher: nn.Module | None = None,
+        max_seq_len: int = 256,
+        source_filter: str | list[str] | None = None,
+        device: str | torch.device = "cpu",
+        model_family: str = "auto",
+    ) -> "GeneratedContrastiveDataset":
+        """Build a dataset from an already-loaded list of pair dicts.
+
+        Writes a temporary JSON and delegates to ``__init__``.  This avoids
+        duplicating the tokenisation / teacher-inference logic while keeping
+        the constructor signature simple.
+        """
+        import tempfile, os
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(pairs, f, ensure_ascii=False)
+            return cls(
+                json_path=tmp_path,
+                tokenizer=tokenizer,
+                teacher=teacher,
+                max_seq_len=max_seq_len,
+                source_filter=source_filter,
+                device=device,
+                model_family=model_family,
+            )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    @classmethod
+    def from_directory(
+        cls,
+        dir_path: str | Path,
+        tokenizer: Any,
+        teacher: nn.Module | None = None,
+        max_seq_len: int = 256,
+        task_types: list[str] | None = None,
+        source_filter: str | list[str] | None = None,
+        device: str | torch.device = "cpu",
+        model_family: str = "auto",
+    ) -> "GeneratedContrastiveDataset":
+        """Load and merge per-task JSONs from a directory.
+
+        Parameters
+        ----------
+        dir_path : str | Path
+            Directory containing per-task JSON files (e.g.
+            ``entity_swap.json``, ``number_perturb.json``).
+        task_types : list[str] | None
+            If given, only load files whose stem matches one of these names.
+            E.g. ``["entity_swap", "number_perturb"]`` loads only those two.
+            If ``None``, all ``*.json`` files in the directory are loaded.
+
+        Other parameters are passed through to the constructor.
+        """
+        dp = Path(dir_path)
+        if not dp.is_dir():
+            raise NotADirectoryError(f"Not a directory: {dp}")
+
+        json_files = sorted(dp.glob("*.json"))
+        if task_types is not None:
+            allowed = set(task_types)
+            json_files = [f for f in json_files if f.stem in allowed]
+
+        if not json_files:
+            raise FileNotFoundError(
+                f"No matching JSON files in {dp} "
+                f"(task_types filter={task_types})"
+            )
+
+        merged: list[dict[str, Any]] = []
+        for jf in json_files:
+            merged.extend(_load_pairs_from_json(jf))
+
+        logger.info(
+            "from_directory: merged %d pairs from %d files in %s",
+            len(merged), len(json_files), dp,
+        )
+
+        return cls._from_pairs(
+            merged,
+            tokenizer=tokenizer,
+            teacher=teacher,
+            max_seq_len=max_seq_len,
+            source_filter=source_filter,
+            device=device,
+            model_family=model_family,
+        )
+
+    @classmethod
+    def from_multiple_files(
+        cls,
+        paths: list[str | Path],
+        tokenizer: Any,
+        teacher: nn.Module | None = None,
+        max_seq_len: int = 256,
+        source_filter: str | list[str] | None = None,
+        device: str | torch.device = "cpu",
+        model_family: str = "auto",
+    ) -> "GeneratedContrastiveDataset":
+        """Load and merge multiple JSON files (paths given explicitly).
+
+        Each file may be in legacy bare-list or per-task envelope format.
+        """
+        merged: list[dict[str, Any]] = []
+        for p in paths:
+            merged.extend(_load_pairs_from_json(Path(p)))
+
+        logger.info(
+            "from_multiple_files: merged %d pairs from %d files",
+            len(merged), len(paths),
+        )
+
+        return cls._from_pairs(
+            merged,
+            tokenizer=tokenizer,
+            teacher=teacher,
+            max_seq_len=max_seq_len,
+            source_filter=source_filter,
+            device=device,
+            model_family=model_family,
+        )

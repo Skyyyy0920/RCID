@@ -91,7 +91,15 @@ def _build_id_dataset(task: str, tokenizer: object):
 def _build_ood_dataset(task: str, tokenizer: object):
     """Build OOD dataset variant for a task."""
     if task == "ioi":
-        return IOIDataset.build_ood_dataset(tokenizer=tokenizer).dataset
+        from rcid.data.ioi import build_single_token_names
+        full_pool = build_single_token_names(tokenizer)
+        # Use the first 20 names as "in-distribution" (matches default IOIDataset)
+        id_names = full_pool[:20] if len(full_pool) > 20 else full_pool[:len(full_pool) // 2]
+        return IOIDataset.build_ood_dataset(
+            tokenizer=tokenizer,
+            name_pool=full_pool,
+            in_distribution_names=id_names,
+        ).dataset
     elif task in ("factual", "factual_probing"):
         return FactualProbingDataset.build_ood_dataset(tokenizer=tokenizer).dataset
     elif task == "winogrande":

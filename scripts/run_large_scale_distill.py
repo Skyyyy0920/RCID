@@ -20,12 +20,20 @@ Usage::
     python scripts/run_large_scale_distill.py --model_family qwen3 \
         --method standard_kd --device cuda:0
 
+    # Per-task directory (new default)
     python scripts/run_large_scale_distill.py --model_family qwen3 \
         --method standard_kd_rcid \
-        --contrastive_pairs_path data/contrastive_pairs.json
+        --contrastive_pairs_path data/contrastive_pairs/
 
+    # With task-type filtering
     python scripts/run_large_scale_distill.py --model_family qwen3 \
-        --method standard_kd_fitnets \
+        --method standard_kd_rcid \
+        --contrastive_pairs_path data/contrastive_pairs/ \
+        --contrastive_task_types entity_swap,number_perturb
+
+    # Legacy single-file
+    python scripts/run_large_scale_distill.py --model_family qwen3 \
+        --method standard_kd_rcid \
         --contrastive_pairs_path data/contrastive_pairs.json
 
     python scripts/run_large_scale_distill.py --model_family llama3 \
@@ -170,6 +178,7 @@ def run_single(
     contrastive_pairs_path: str | None,
     output_dir: str,
     *,
+    contrastive_task_types: list[str] | None = None,
     epochs: int = 3,
     batch_size: int = 8,
     gradient_accumulation: int = 4,
@@ -250,14 +259,32 @@ def run_single(
 
         from rcid.data.generated_contrastive import GeneratedContrastiveDataset
 
-        logger.info("Loading contrastive pairs: %s", contrastive_pairs_path)
-        contrastive_ds = GeneratedContrastiveDataset(
-            json_path=contrastive_pairs_path,
-            tokenizer=tokenizer,
-            teacher=teacher,
-            max_seq_len=max_seq_len,
-            device=device,
-        )
+        cp_path = Path(contrastive_pairs_path)
+
+        if cp_path.is_dir():
+            # Per-task directory mode
+            logger.info(
+                "Loading contrastive pairs from directory: %s (task_types=%s)",
+                cp_path, contrastive_task_types,
+            )
+            contrastive_ds = GeneratedContrastiveDataset.from_directory(
+                dir_path=cp_path,
+                tokenizer=tokenizer,
+                teacher=teacher,
+                max_seq_len=max_seq_len,
+                task_types=contrastive_task_types,
+                device=device,
+            )
+        else:
+            # Legacy single-file mode
+            logger.info("Loading contrastive pairs: %s", cp_path)
+            contrastive_ds = GeneratedContrastiveDataset(
+                json_path=cp_path,
+                tokenizer=tokenizer,
+                teacher=teacher,
+                max_seq_len=max_seq_len,
+                device=device,
+            )
         logger.info("Contrastive dataset: %d pairs", len(contrastive_ds))
 
         # CKA → layer mapping → Procrustes W → checkpoints
@@ -397,7 +424,16 @@ def main() -> None:
     )
     ap.add_argument(
         "--contrastive_pairs_path", default=None,
-        help="JSON file of contrastive pairs (required for non-standard_kd)",
+        help="Path to contrastive pairs: a JSON file (legacy) or a "
+             "directory of per-task JSONs (new default). "
+             "Required for non-standard_kd methods.",
+    )
+    ap.add_argument(
+        "--contrastive_task_types", default=None,
+        help="Comma-separated generator/task types to load from a "
+             "per-task directory (e.g. 'entity_swap,number_perturb'). "
+             "Ignored when contrastive_pairs_path is a file. "
+             "Default: load all .json files in the directory.",
     )
     ap.add_argument("--max_train_samples", type=int, default=52000)
     ap.add_argument("--epochs", type=int, default=3)
@@ -421,8 +457,13 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Parse contrastive_task_types
+    task_types: list[str] | None = None
+    if args.contrastive_task_types:
+        task_types = [t.strip() for t in args.contrastive_task_types.split(",")]
+
     logger.info(
-        "=== Exp3: method=%s  family=%s  seed=%d  data=%s ===",
+        "=== Large-scale distill: method=%s  family=%s  seed=%d  data=%s ===",
         args.method, args.model_family, args.seed, args.data_source,
     )
 
@@ -435,6 +476,7 @@ def main() -> None:
         max_train_samples=args.max_train_samples,
         contrastive_pairs_path=args.contrastive_pairs_path,
         output_dir=args.output_dir,
+        contrastive_task_types=task_types,
         epochs=args.epochs,
         batch_size=args.batch_size,
         gradient_accumulation=args.gradient_accumulation,
