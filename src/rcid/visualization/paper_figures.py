@@ -29,11 +29,18 @@ METHOD_LABELS = {
 
 
 def _load_results(results_dir: Path) -> list[dict[str, Any]]:
-    """Load all JSON result files from a directory."""
+    """Load all JSON result files from a directory (skips summary files)."""
+    if not results_dir.exists():
+        return []
     results = []
     for p in sorted(results_dir.glob("**/*.json")):
-        with open(p) as f:
-            results.append(json.load(f))
+        if "summary" in p.name:
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                results.append(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            continue
     return results
 
 
@@ -178,34 +185,54 @@ def plot_exp4_bar(
     results_dir: Path,
     output_path: Path,
 ) -> None:
-    """Bar chart: information selectivity of h^T vs d^T."""
+    """Bar chart: information selectivity of h^T vs d^T.
+
+    Reads from exp4 JSON format::
+
+        {"meta": {"task": "ioi", ...},
+         "layers": {"0": {"h_T": {"selectivity": ...},
+                          "d_T": {"selectivity": ...},
+                          "selectivity_gain": ...}, ...}}
+    """
     results = _load_results(results_dir)
     if not results:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    tasks = []
-    h_sel = []
-    d_sel = []
+    labels: list[str] = []
+    h_sel: list[float] = []
+    d_sel: list[float] = []
 
     for r in results:
-        task = r.get("task", "unknown")
-        for layer_data in r.get("per_layer", {}).values():
-            tasks.append(task)
-            h_sel.append(layer_data.get("h_selectivity", 0.0))
-            d_sel.append(layer_data.get("d_selectivity", 0.0))
+        # exp4 stores task in r["meta"]["task"]
+        task = r.get("meta", {}).get("task", r.get("task", "unknown"))
+        # exp4 stores layer data under "layers" key (not "per_layer")
+        layers_dict = r.get("layers", r.get("per_layer", {}))
+        for layer_key, layer_data in layers_dict.items():
+            labels.append(f"{task} L{layer_key}")
+            # exp4 saves nested dicts: h_T/d_T each with "selectivity" key
+            h_T_data = layer_data.get("h_T", {})
+            d_T_data = layer_data.get("d_T", {})
+            if isinstance(h_T_data, dict):
+                h_sel.append(h_T_data.get("selectivity", 0.0))
+            else:
+                h_sel.append(layer_data.get("h_selectivity", 0.0))
+            if isinstance(d_T_data, dict):
+                d_sel.append(d_T_data.get("selectivity", 0.0))
+            else:
+                d_sel.append(layer_data.get("d_selectivity", 0.0))
 
-    if not tasks:
+    if not labels:
         plt.close(fig)
         return
 
     import numpy as np
-    x = np.arange(len(tasks))
+    x = np.arange(len(labels))
     width = 0.35
     ax.bar(x - width / 2, h_sel, width, label=r"$h^T$ (raw)", color=PALETTE[0])
     ax.bar(x + width / 2, d_sel, width, label=r"$d^T$ (contrastive)", color=PALETTE[3])
     ax.set_xticks(x)
-    ax.set_xticklabels(tasks, rotation=45, ha="right")
+    ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Selectivity")
     ax.set_title("Exp 4: Information Purity")
     ax.legend()

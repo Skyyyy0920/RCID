@@ -36,7 +36,8 @@ def extract_residual_at_layers(
 
         def _make_hook(idx: int):  # noqa: E301
             def _hook(
-                module: nn.Module, input: tuple, output: tuple
+                module: nn.Module, input: tuple,
+                output: torch.Tensor | tuple,
             ) -> None:
                 h = adapter.parse_layer_output(output)  # (batch, seq, d_model)
                 cache[idx] = h.detach().clone()
@@ -91,7 +92,8 @@ def extract_residual_at_layers_with_grad(
 
         def _make_hook(idx: int):  # noqa: E301
             def _hook(
-                module: nn.Module, input: tuple, output: tuple
+                module: nn.Module, input: tuple,
+                output: torch.Tensor | tuple,
             ) -> None:
                 h = adapter.parse_layer_output(output)  # (batch, seq, d_model)
                 cache[idx] = h  # keep grad graph

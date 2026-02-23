@@ -13,7 +13,7 @@ ood_variants:
     - unseen_names
     - different_templates
     - longer_context
-  factual_probing:
+  factual:
     - different_relations
     - different_entities
   winogrande:
@@ -22,5 +22,7 @@ ood_variants:
 
 data:
   n_samples: 200
+
+seeds: [42, 123, 456]
 
 output_dir: outputs/results/exp3

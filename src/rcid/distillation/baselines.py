@@ -8,7 +8,12 @@ import torch.nn.functional as F
 
 
 class StandardKDLoss(nn.Module):
-    """Standard Knowledge Distillation via KL divergence on logits."""
+    """Standard Knowledge Distillation via KL divergence on logits.
+
+    Supports two input shapes:
+    - 2D: (batch, vocab) — single-position KL (backward compatible with toy data)
+    - 3D: (batch, seq_len, vocab) — per-token KL over the full sequence
+    """
 
     def __init__(self, temperature: float = 2.0) -> None:
         super().__init__()
@@ -16,13 +21,36 @@ class StandardKDLoss(nn.Module):
 
     def forward(
         self,
-        teacher_logits: torch.Tensor,  # (batch, seq, vocab) or (batch, vocab)
-        student_logits: torch.Tensor,  # same shape as teacher
+        teacher_logits: torch.Tensor,  # (batch, vocab) or (batch, seq_len, vocab)
+        student_logits: torch.Tensor,  # same shape as teacher_logits
+        mask: torch.Tensor | None = None,  # (batch, seq_len), 1=valid 0=padding
     ) -> torch.Tensor:
         T = self.temperature
-        t_probs = F.softmax(teacher_logits / T, dim=-1)
-        s_log_probs = F.log_softmax(student_logits / T, dim=-1)
-        loss = F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (T * T)
+        # Upcast to FP32 for softmax: FP16 overflows on large vocab (151k).
+        t_logits_f = teacher_logits.float() / T  # (batch, [seq_len,] vocab)
+        s_logits_f = student_logits.float() / T  # (batch, [seq_len,] vocab)
+        t_probs = F.softmax(t_logits_f, dim=-1)
+        s_log_probs = F.log_softmax(s_logits_f, dim=-1)
+
+        if teacher_logits.dim() == 2:
+            # --- 2D path: (batch, vocab) — original single-position KL ---
+            loss = F.kl_div(
+                s_log_probs, t_probs, reduction="batchmean",
+            ) * (T * T)
+        else:
+            # --- 3D path: (batch, seq_len, vocab) — per-token KL ---
+            per_token_kl = F.kl_div(
+                s_log_probs, t_probs, reduction="none",
+            ).sum(dim=-1)  # (batch, seq_len)
+
+            if mask is not None:
+                # mask: (batch, seq_len), 1=valid 0=padding
+                loss = (per_token_kl * mask).sum() / mask.sum().clamp(min=1)
+            else:
+                loss = per_token_kl.mean()
+
+            loss = loss * (T * T)
+
         assert loss.isfinite(), f"KD loss is {loss.item()}"
         return loss
 

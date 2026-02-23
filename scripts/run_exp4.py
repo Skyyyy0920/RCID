@@ -11,6 +11,11 @@ import json
 import logging
 from pathlib import Path
 
+import sys
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+
 import torch
 
 from rcid import set_all_seeds

@@ -40,6 +40,32 @@ class TestStandardKDLoss:
         assert s_logits.grad is not None
         assert s_logits.grad.abs().sum() > 0
 
+    def test_sequence_level_kl(self) -> None:
+        """3D input (batch, seq_len, vocab) computes per-token KL."""
+        t_logits = torch.randn(4, 10, 100)
+        s_logits = torch.randn(4, 10, 100)
+        loss = StandardKDLoss(temperature=2.0)(t_logits, s_logits)
+        assert loss.item() > 0
+        assert loss.isfinite()
+
+    def test_sequence_level_kl_with_mask(self) -> None:
+        """Masked sequence KL ignores padding positions."""
+        t_logits = torch.randn(4, 10, 100)
+        s_logits = torch.randn(4, 10, 100)
+        mask = torch.ones(4, 10)
+        mask[:, -2:] = 0  # last two positions are padding
+        loss = StandardKDLoss()(t_logits, s_logits, mask=mask)
+        assert loss.item() > 0
+        assert loss.isfinite()
+
+    def test_2d_backward_compatible(self) -> None:
+        """2D input (batch, vocab) still works and produces gradients."""
+        t_logits = torch.randn(4, 100)
+        s_logits = torch.randn(4, 100, requires_grad=True)
+        loss = StandardKDLoss()(t_logits, s_logits)
+        loss.backward()
+        assert s_logits.grad is not None
+
 
 # ---------------------------------------------------------------------------
 # RCID loss tests
@@ -175,7 +201,7 @@ class TestUnifiedTrainer:
             is_modified={"s2": True},
             model_family="test",
         )
-        config = {"epochs": 2, "batch_size": 4, "lr": 1e-3, "fp16": False}
+        config = {"epochs": 2, "batch_size": 4, "lr": 1e-3, "fp16": False, "kl_mode": "sequence"}
         return teacher, student, adapter, ds, config
 
     def test_standard_kd_trains(self, tiny_setup) -> None:

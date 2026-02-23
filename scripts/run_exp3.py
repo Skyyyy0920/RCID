@@ -14,32 +14,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from pathlib import Path
 
 import torch
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
+from common import MODEL_CONFIGS
 from rcid import set_all_seeds
 from rcid.data.factual_probing import FactualProbingDataset
-from rcid.data.ioi import IOIDataset, build_single_token_names
+from rcid.data.ioi import IOIDataset
 from rcid.data.winogrande import WinoGrandeDataset
 from rcid.eval.ood_robustness import evaluate_ood_robustness
 from rcid.eval.task_accuracy import evaluate_task_accuracy
-from rcid.models.adapter import get_adapter
-from rcid.models.student import load_student_from_checkpoint
+from rcid.models.student import load_student, load_student_from_checkpoint
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-STUDENT_NAMES: dict[str, str] = {
-    "qwen3": "Qwen/Qwen3-0.6B",
-    "llama3": "meta-llama/Llama-3.2-1B",
-}
 
 
 def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -51,9 +40,7 @@ def _pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
     return (num / den).item()
 
 
-def _collect_result_files(
-    results_dir: Path, model_family: str
-) -> list[dict]:
+def _collect_result_files(results_dir: Path, model_family: str) -> list[dict]:
     """Scan exp1/ and exp2/ for result JSON files matching model_family."""
     entries: list[dict] = []
     for exp_dir in ["exp1", "exp2"]:
@@ -61,7 +48,9 @@ def _collect_result_files(
         if not search_root.exists():
             logger.warning("Directory not found: %s", search_root)
             continue
-        for json_path in search_root.glob("*.json"):
+        for json_path in sorted(search_root.glob("*.json")):
+            if "summary" in json_path.name:
+                continue
             try:
                 data = json.loads(json_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as exc:
@@ -69,45 +58,29 @@ def _collect_result_files(
                 continue
             if data.get("model_family") != model_family:
                 continue
-            if "checkpoint_path" not in data or "causal_consistency" not in data:
-                logger.warning("Missing fields in %s, skipping", json_path)
+            if "checkpoint_path" not in data:
+                logger.warning("No checkpoint_path in %s, skipping", json_path)
                 continue
+            # Accept both flat and nested causal_consistency formats
+            cc = data.get("causal_consistency")
+            if cc is None:
+                logger.warning("No causal_consistency in %s, skipping", json_path)
+                continue
+            # Normalize: if cc is a dict, extract mean_correlation
+            if isinstance(cc, dict):
+                data["_cc_value"] = cc.get("mean_correlation", 0.0)
+            else:
+                data["_cc_value"] = float(cc)
             entries.append(data)
     logger.info("Found %d result entries for %s", len(entries), model_family)
     return entries
 
 
-def _build_ood_dataset(
-    task: str, tokenizer, name_pool: list[str]
-):
-    """Build the OOD dataset variant for a given task name."""
+def _build_id_dataset(task: str, tokenizer: object):
+    """Build in-distribution dataset for a task."""
     if task == "ioi":
-        return IOIDataset.build_ood_dataset(
-            tokenizer=tokenizer,
-            name_pool=name_pool,
-            in_distribution_names=name_pool[:10],
-            n_samples=50,
-        ).dataset
-    elif task == "factual_probing":
-        return FactualProbingDataset.build_ood_dataset(
-            tokenizer=tokenizer,
-        ).dataset
-    elif task == "winogrande":
-        return WinoGrandeDataset.build_ood_dataset(
-            tokenizer=tokenizer,
-        ).dataset
-    else:
-        raise ValueError(f"Unknown task: {task}")
-
-
-def _build_id_dataset(
-    task: str, tokenizer, name_pool: list[str]
-):
-    """Build the in-distribution dataset for a given task name."""
-    if task == "ioi":
-        return IOIDataset(tokenizer=tokenizer, n_samples=100,
-                          name_pool=name_pool, seed=42).dataset
-    elif task == "factual_probing":
+        return IOIDataset(tokenizer=tokenizer, n_samples=100, seed=42).dataset
+    elif task in ("factual", "factual_probing"):
         return FactualProbingDataset(tokenizer=tokenizer, seed=42).dataset
     elif task == "winogrande":
         return WinoGrandeDataset(tokenizer=tokenizer, seed=42).dataset
@@ -115,140 +88,113 @@ def _build_id_dataset(
         raise ValueError(f"Unknown task: {task}")
 
 
+def _build_ood_dataset(task: str, tokenizer: object):
+    """Build OOD dataset variant for a task."""
+    if task == "ioi":
+        return IOIDataset.build_ood_dataset(tokenizer=tokenizer).dataset
+    elif task in ("factual", "factual_probing"):
+        return FactualProbingDataset.build_ood_dataset(tokenizer=tokenizer).dataset
+    elif task == "winogrande":
+        return WinoGrandeDataset.build_ood_dataset(tokenizer=tokenizer).dataset
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Exp3: CC vs OOD robustness correlation"
-    )
-    parser.add_argument(
-        "--model_family", choices=["qwen3", "llama3"], required=True
-    )
+    parser = argparse.ArgumentParser(description="Exp3: CC vs OOD correlation")
+    parser.add_argument("--model_family", choices=["qwen3", "llama3"], required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument(
-        "--results_dir", default="outputs/results",
-        help="Root results directory containing exp1/ and exp2/",
-    )
-    parser.add_argument(
-        "--output_dir", default=None,
-        help="Output directory (default: outputs/results/exp3/{model_family})",
-    )
+    parser.add_argument("--results_dir", default="outputs/results")
+    parser.add_argument("--output_dir", default=None)
     args = parser.parse_args()
 
     set_all_seeds(42)
     results_dir = Path(args.results_dir)
-    output_dir = (
-        Path(args.output_dir)
-        if args.output_dir
-        else results_dir / "exp3" / args.model_family
-    )
+    output_dir = (Path(args.output_dir) if args.output_dir
+                  else results_dir / "exp3" / args.model_family)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    student_name = STUDENT_NAMES[args.model_family]
+    cfg = MODEL_CONFIGS[args.model_family]
+    student_name = cfg["student"]
 
-    # --- Collect previous experiment results ---
     entries = _collect_result_files(results_dir, args.model_family)
     if not entries:
         logger.error("No result files found. Run exp1/exp2 first.")
-        sys.exit(1)
+        return
 
-    # --- Preload tokenizer once to build datasets ---
+    # Load tokenizer once (cheap, no GPU needed)
     logger.info("Loading tokenizer from %s ...", student_name)
-    _, adapter, tokenizer = load_student_from_checkpoint(
-        entries[0]["checkpoint_path"], student_name,
-        device="cpu", dtype=torch.float32,
-    )
-    name_pool = build_single_token_names(tokenizer)
+    _, _, tokenizer = load_student(student_name, device="cpu", dtype=torch.float32)
 
-    # Cache datasets to avoid rebuilding per student
+    # Cache datasets per task
     id_datasets: dict[str, object] = {}
     ood_datasets: dict[str, object] = {}
 
-    # --- Evaluate each student ---
     scatter_data: list[dict] = []
     for idx, entry in enumerate(entries):
-        method = entry["method"]
-        task = entry["task"]
+        method = entry.get("method", "unknown")
+        task = entry.get("task", "unknown")
         seed = entry.get("seed", 0)
-        cc = entry["causal_consistency"]["mean_correlation"]
+        cc = entry["_cc_value"]
         ckpt = entry["checkpoint_path"]
 
-        logger.info(
-            "[%d/%d] method=%s task=%s seed=%d cc=%.4f",
-            idx + 1, len(entries), method, task, seed, cc,
-        )
+        logger.info("[%d/%d] method=%s task=%s seed=%d cc=%.4f",
+                    idx + 1, len(entries), method, task, seed, cc)
 
-        # Build datasets (cached)
         if task not in id_datasets:
-            id_datasets[task] = _build_id_dataset(task, tokenizer, name_pool)
+            id_datasets[task] = _build_id_dataset(task, tokenizer)
         if task not in ood_datasets:
-            ood_datasets[task] = _build_ood_dataset(task, tokenizer, name_pool)
+            ood_datasets[task] = _build_ood_dataset(task, tokenizer)
 
-        # Load student
         model, adapter, _ = load_student_from_checkpoint(
             ckpt, student_name, device=args.device, dtype=torch.float16,
         )
         model.eval()
 
-        # ID accuracy
         id_result = evaluate_task_accuracy(model, adapter, id_datasets[task])
         id_acc = id_result["accuracy"]
 
-        # OOD robustness
         ood_result = evaluate_ood_robustness(
-            model, adapter, ood_datasets[task], id_acc
+            model, adapter, ood_datasets[task], id_acc,
         )
-        ood_deg = ood_result["relative_degradation"]
 
         scatter_data.append({
-            "method": method,
-            "task": task,
-            "seed": seed,
+            "method": method, "task": task, "seed": seed,
             "causal_consistency": cc,
             "id_accuracy": id_acc,
             "ood_accuracy": ood_result["ood_accuracy"],
-            "ood_degradation": ood_deg,
+            "ood_degradation": ood_result["relative_degradation"],
         })
-        logger.info(
-            "  id_acc=%.4f ood_acc=%.4f degradation=%.4f",
-            id_acc, ood_result["ood_accuracy"], ood_deg,
-        )
+        logger.info("  id_acc=%.4f ood_acc=%.4f degradation=%.4f",
+                    id_acc, ood_result["ood_accuracy"], ood_result["relative_degradation"])
 
-        # Free GPU memory
         del model
         torch.cuda.empty_cache()
 
-    # --- Compute overall correlation ---
+    # Correlation
     cc_vals = torch.tensor([d["causal_consistency"] for d in scatter_data])
     deg_vals = torch.tensor([d["ood_degradation"] for d in scatter_data])
     n_points = len(scatter_data)
 
     if n_points < 3:
-        logger.warning("Only %d data points; correlation unreliable.", n_points)
         pearson = float("nan")
     else:
-        pearson = _pearson_r(cc_vals, -deg_vals)  # higher CC → lower degradation
+        pearson = _pearson_r(cc_vals, -deg_vals)
 
-    logger.info("=" * 60)
     logger.info("Pearson(CC, -OOD_degradation) = %.4f  (n=%d)", pearson, n_points)
-    logger.info("=" * 60)
 
-    # --- Per-task breakdown ---
+    # Per-task breakdown
     tasks_seen = sorted({d["task"] for d in scatter_data})
     per_task: dict[str, dict] = {}
     for task in tasks_seen:
         subset = [d for d in scatter_data if d["task"] == task]
         if len(subset) < 3:
             per_task[task] = {"pearson": float("nan"), "n": len(subset)}
-            continue
-        t_cc = torch.tensor([d["causal_consistency"] for d in subset])
-        t_deg = torch.tensor([d["ood_degradation"] for d in subset])
-        per_task[task] = {
-            "pearson": _pearson_r(t_cc, -t_deg),
-            "n": len(subset),
-        }
-        logger.info("  %s: r=%.4f (n=%d)", task, per_task[task]["pearson"],
-                     per_task[task]["n"])
+        else:
+            t_cc = torch.tensor([d["causal_consistency"] for d in subset])
+            t_deg = torch.tensor([d["ood_degradation"] for d in subset])
+            per_task[task] = {"pearson": _pearson_r(t_cc, -t_deg), "n": len(subset)}
 
-    # --- Save ---
     output = {
         "model_family": args.model_family,
         "n_students": n_points,

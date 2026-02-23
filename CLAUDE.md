@@ -956,3 +956,45 @@ Section 4: Experiments
 Section 5: Discussion
   → 跨架构讨论、MoE 未来方向、局限性
 ```
+
+---
+
+## 十六、大规模蒸馏扩展
+
+### 16.1 新增实验：大规模蒸馏 + RCID 正则
+
+RCID 作为即插即用正则项嫁接到标准大规模 KL 蒸馏上：
+
+$$\mathcal{L} = \mathcal{L}_{\text{KL}}^{\text{seq-level}} + \lambda \cdot \mathcal{L}_{\text{RCID}}$$
+
+- 主损失：在 Alpaca-52K 上做全序列 KL 蒸馏
+- RCID 正则：在自动构造的 ~5K 对比对上做因果差值匹配
+- 评估：MMLU, GSM8K, ARC, HellaSwag, WinoGrande, TruthfulQA
+
+### 16.2 KL Loss 修正
+
+所有蒸馏方法使用全序列 per-token KL（与主流一致），不再仅在 answer_pos 计算。
+配置项 `kl_mode: "sequence" | "answer_only"`
+
+### 16.3 自动对比对构造
+
+三种生成器：
+- `EntitySwapGenerator`：实体替换（事实知识）
+- `NumberPerturbGenerator`：数字扰动（数学推理）
+- `LLMGenerator`：教师自动生成（通用）
+
+质量验证：`ContrastivePairValidator` 确保改动最小且 teacher 输出确实改变
+
+### 16.4 新增文件
+
+```
+src/rcid/data/contrastive_generators.py    # 三种自动对比对生成器
+src/rcid/data/contrastive_validator.py     # 质量验证
+src/rcid/data/generated_contrastive.py     # 从 JSON 加载对比对的 Dataset
+src/rcid/data/instruction_dataset.py       # 大规模指令数据加载
+src/rcid/distillation/scalable_trainer.py  # 大规模蒸馏训练器
+scripts/generate_contrastive_pairs.py      # 生成对比对脚本
+scripts/run_large_scale_distill.py         # 大规模蒸馏实验
+scripts/eval_benchmarks.py                 # Benchmark 评估
+configs/large_scale.yaml                   # 配置
+```

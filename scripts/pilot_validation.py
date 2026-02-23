@@ -24,7 +24,10 @@ from rcid.data.ioi import IOIDataset, build_single_token_names
 
 MODEL_CONFIGS = {
     "qwen3": {"teacher": "Qwen/Qwen3-8B", "student": "Qwen/Qwen3-0.6B"},
-    "llama3": {"teacher": "meta-llama/Llama-3.1-8B", "student": "meta-llama/Llama-3.2-1B"},
+    "llama3": {
+        "teacher": "meta-llama/Llama-3.1-8B",
+        "student": "meta-llama/Llama-3.2-1B",
+    },
 }
 
 
@@ -43,8 +46,10 @@ def _extract_residual_norms(
         handles = []
         for l in range(n_layers):
             hp = adapter.get_residual_hook_point(model, l)
+
             def _hook(mod, inp, out, idx=l):
                 cache[idx] = adapter.parse_layer_output(out).detach().clone()
+
             handles.append(hp.register_forward_hook(_hook))
         try:
             with torch.no_grad():
@@ -80,19 +85,22 @@ def _patch_and_measure(
     with torch.no_grad():
         orig_logits = model(clean_ids).logits
     batch_idx = torch.arange(clean_ids.shape[0], device=device)
-    orig_diff = (
-        orig_logits[batch_idx, answer_pos].gather(1, correct_id.unsqueeze(1)).squeeze(1)
-        - orig_logits[batch_idx, answer_pos].gather(1, wrong_id.unsqueeze(1)).squeeze(1)
+    orig_diff = orig_logits[batch_idx, answer_pos].gather(
+        1, correct_id.unsqueeze(1)
+    ).squeeze(1) - orig_logits[batch_idx, answer_pos].gather(
+        1, wrong_id.unsqueeze(1)
+    ).squeeze(
+        1
     )
 
     # Get corrupt value
     cache = {}
     hp = adapter.get_residual_hook_point(model, layer)
-    handle = hp.register_forward_hook(
-        lambda mod, inp, out: cache.update({
-            "h": adapter.parse_layer_output(out)[:, token_pos, :].detach().clone()
-        })
-    )
+
+    def _capture(mod, inp, out):
+        cache["h"] = adapter.parse_layer_output(out)[:, token_pos, :].detach().clone()
+
+    handle = hp.register_forward_hook(_capture)
     try:
         with torch.no_grad():
             model(corrupt_ids)
@@ -103,6 +111,9 @@ def _patch_and_measure(
     def _patch_hook(mod, inp, out):
         h = adapter.parse_layer_output(out).clone()
         h[:, token_pos, :] = cache["h"]
+        # Reconstruct output in the same format (bare tensor or tuple)
+        if isinstance(out, torch.Tensor):
+            return h
         return (h,) + out[1:]
 
     handle2 = hp.register_forward_hook(_patch_hook)
@@ -112,9 +123,12 @@ def _patch_and_measure(
     finally:
         handle2.remove()
 
-    patched_diff = (
-        patched_logits[batch_idx, answer_pos].gather(1, correct_id.unsqueeze(1)).squeeze(1)
-        - patched_logits[batch_idx, answer_pos].gather(1, wrong_id.unsqueeze(1)).squeeze(1)
+    patched_diff = patched_logits[batch_idx, answer_pos].gather(
+        1, correct_id.unsqueeze(1)
+    ).squeeze(1) - patched_logits[batch_idx, answer_pos].gather(
+        1, wrong_id.unsqueeze(1)
+    ).squeeze(
+        1
     )
     delta = (orig_diff - patched_diff).mean().item()
     return delta
@@ -135,7 +149,9 @@ def main() -> None:
     print("[Step 1] Loading teacher model...")
     teacher, adapter, tokenizer = load_teacher(cfg["teacher"], device=args.device)
     print(f"  Model loaded: {cfg['teacher']}")
-    print(f"  Layers: {adapter.get_num_layers(teacher)}, d_model: {adapter.get_hidden_size(teacher)}")
+    print(
+        f"  Layers: {adapter.get_num_layers(teacher)}, d_model: {adapter.get_hidden_size(teacher)}"
+    )
 
     # Step 2: Validate single-token name pool
     print("\n[Step 2] Checking single-token name pool...")
@@ -159,7 +175,9 @@ def main() -> None:
         logits = teacher(ds.clean_ids.to(device)).logits
     batch_idx = torch.arange(len(ds), device=device)
     ans_logits = logits[batch_idx, ds.answer_pos.to(device)]
-    correct = ans_logits.gather(1, ds.correct_token_id.to(device).unsqueeze(1)).squeeze(1)
+    correct = ans_logits.gather(1, ds.correct_token_id.to(device).unsqueeze(1)).squeeze(
+        1
+    )
     wrong = ans_logits.gather(1, ds.wrong_token_id.to(device).unsqueeze(1)).squeeze(1)
     accuracy = (correct > wrong).float().mean().item()
     print(f"  Teacher IOI accuracy: {accuracy:.2%}")
@@ -170,7 +188,8 @@ def main() -> None:
     print("\n[Step 4] Extracting contrastive difference norms...")
     subset = 10
     norms = _extract_residual_norms(
-        teacher, adapter,
+        teacher,
+        adapter,
         ds.clean_ids[:subset].to(device),
         ds.corrupt_ids[:subset].to(device),
     )
@@ -190,20 +209,30 @@ def main() -> None:
     if high_layers_norm <= low_layers_norm:
         print("  WARNING: High layers not showing larger norms than low layers")
     else:
-        print(f"  PASS: High-layer mean ({high_layers_norm/(n_layers//2):.4f}) > "
-              f"Low-layer mean ({low_layers_norm/(n_layers//2):.4f})")
+        print(
+            f"  PASS: High-layer mean ({high_layers_norm/(n_layers//2):.4f}) > "
+            f"Low-layer mean ({low_layers_norm/(n_layers//2):.4f})"
+        )
 
     # Step 5: Activation patching
     print("\n[Step 5] Activation patching at best checkpoint...")
-    best_layer = max(norms.keys(), key=lambda l: norms[l].max().item())
+    # best_layer = max(norms.keys(), key=lambda l: norms[l].max().item())
+    n_layers = len(norms)
+    max_layer = int(n_layers * 0.85)  # 36层 → 最高选 layer 30
+    candidate_layers = {l: norms[l] for l in norms if l <= max_layer}
+    best_layer = max(
+        candidate_layers.keys(), key=lambda l: candidate_layers[l].max().item()
+    )
     best_pos = norms[best_layer].argmax().item()
     print(f"  Best checkpoint: layer={best_layer}, pos={best_pos}")
 
     delta = _patch_and_measure(
-        teacher, adapter,
+        teacher,
+        adapter,
         ds.clean_ids[:subset].to(device),
         ds.corrupt_ids[:subset].to(device),
-        layer=best_layer, token_pos=best_pos,
+        layer=best_layer,
+        token_pos=best_pos,
         answer_pos=ds.answer_pos[:subset].to(device),
         correct_id=ds.correct_token_id[:subset].to(device),
         wrong_id=ds.wrong_token_id[:subset].to(device),

@@ -32,8 +32,8 @@ def patch_and_run(
     hook_point = adapter.get_residual_hook_point(model, layer)
 
     def _patch_hook(
-        module: nn.Module, input: tuple, output: tuple
-    ) -> tuple:
+        module: nn.Module, input: tuple, output: torch.Tensor | tuple
+    ) -> torch.Tensor | tuple:
         h = adapter.parse_layer_output(output).clone()  # (batch, seq, d_model)
         if isinstance(token_pos, int):
             h[:, token_pos, :] = patch_value
@@ -41,6 +41,9 @@ def patch_and_run(
             # Per-sample positions: token_pos is (batch,)
             batch_idx = torch.arange(h.shape[0], device=h.device)
             h[batch_idx, token_pos, :] = patch_value
+        # Reconstruct output in the same format (bare tensor or tuple)
+        if isinstance(output, torch.Tensor):
+            return h
         return (h,) + output[1:]
 
     handle = hook_point.register_forward_hook(_patch_hook)
@@ -107,7 +110,7 @@ def compute_causal_effect(
     hook_point = adapter.get_residual_hook_point(model, layer)
 
     def _capture_hook(
-        module: nn.Module, input: tuple, output: tuple
+        module: nn.Module, input: tuple, output: torch.Tensor | tuple
     ) -> None:
         h = adapter.parse_layer_output(output)  # (batch, seq, d_model)
         if isinstance(token_pos, int):

@@ -5,7 +5,12 @@
       "Bash(git -C \"W:\\\\Beyond Output Mimicry Preserving Internal Mechanisms in Knowledge Distillation via Contrastive Residual Alignment\\\\RCID\" log --oneline --all)",
       "Bash(pip install:*)",
       "Bash(python -m pytest:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(find:*)",
+      "Bash(sort:*)"
     ]
   }
 }

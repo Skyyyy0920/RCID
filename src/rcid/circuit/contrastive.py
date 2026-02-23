@@ -49,11 +49,12 @@ class ContrastiveDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | int | bool]:
         item: dict[str, torch.Tensor | int | bool] = {
-            "clean_ids": self.clean_ids[idx],           # (seq_len,)
-            "corrupt_ids": self.corrupt_ids[idx],       # (seq_len,)
-            "answer_pos": self.answer_pos[idx],         # scalar
-            "correct_token_id": self.correct_token_id[idx],  # scalar
-            "wrong_token_id": self.wrong_token_id[idx],      # scalar
+            "index": idx,                                     # dataset index
+            "clean_ids": self.clean_ids[idx],                 # (seq_len,)
+            "corrupt_ids": self.corrupt_ids[idx],             # (seq_len,)
+            "answer_pos": self.answer_pos[idx],               # scalar
+            "correct_token_id": self.correct_token_id[idx],   # scalar
+            "wrong_token_id": self.wrong_token_id[idx],       # scalar
         }
         for name, pos_tensor in self.key_positions.items():
             item[f"pos_{name}"] = pos_tensor[idx]

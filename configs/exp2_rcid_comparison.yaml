@@ -14,11 +14,22 @@ methods:
 
 tasks:
   - ioi
-  - factual_probing
+  - factual
   - winogrande
+
+seeds: [42, 123, 456]
 
 data:
   n_samples: 500
+
+checkpoint_selection:
+  top_k: 20
+  diversity_ratio: 0.5
+
+training:
+  epochs: 20
+  batch_size: 16
+  lr: 5.0e-5
 
 evaluation:
   task_accuracy: true

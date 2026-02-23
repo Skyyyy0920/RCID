@@ -19,6 +19,10 @@ def procrustes_align(
         f"Sample count mismatch: {source.shape[0]} vs {target.shape[0]}"
     )
 
+    # Upcast to float32: teacher may be FP16, student FP32 after training upcast.
+    source = source.float()
+    target = target.float()
+
     # Center
     source_c = source - source.mean(dim=0, keepdim=True)
     target_c = target - target.mean(dim=0, keepdim=True)

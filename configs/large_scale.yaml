@@ -1,0 +1,63 @@
+# Large-scale distillation configuration
+# Experiment 3: Standard KD + RCID regularizer on real benchmarks
+
+experiment: large_scale_distillation
+
+# Model
+model_family: qwen3
+teacher: Qwen/Qwen3-8B
+student: Qwen/Qwen3-0.6B
+
+# Main training data
+data:
+  source: tatsu-lab/alpaca
+  max_samples: 52000
+  max_seq_len: 512
+
+# Contrastive pairs (for RCID)
+contrastive:
+  pairs_path: data/contrastive_pairs.json
+  max_pairs: 5000
+
+# Training
+training:
+  epochs: 3
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  fp16: true
+  save_every_n_epochs: 1
+
+# KL distillation
+kl:
+  temperature: 2.0
+  mode: sequence  # "sequence" or "answer_only"
+
+# RCID regularizer
+rcid:
+  enabled: true
+  lambda: 0.1
+  every_n_steps: 5
+  top_k_checkpoints: 20
+
+# Evaluation benchmarks
+eval:
+  benchmarks:
+    - mmlu
+    - gsm8k
+    - arc_challenge
+    - hellaswag
+    - winogrande
+    - truthfulqa
+
+# Methods to compare
+methods:
+  - standard_kd
+  - standard_kd_rcid
+
+seeds: [42, 123, 456]
+
+output_dir: outputs/large_scale

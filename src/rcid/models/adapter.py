@@ -36,8 +36,13 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def parse_layer_output(self, output: tuple) -> torch.Tensor:
-        """Extract residual stream tensor from layer output."""
+    def parse_layer_output(self, output: torch.Tensor | tuple) -> torch.Tensor:
+        """Extract residual stream tensor from layer output.
+
+        HuggingFace decoder layers may return a bare tensor or a tuple
+        depending on the model and transformers version. Implementations
+        must handle both cases.
+        """
         ...
 
     @abstractmethod
@@ -72,7 +77,10 @@ class Qwen3Adapter(ModelAdapter):
     ) -> nn.Module:
         return model.model.layers[layer_idx]  # type: ignore[return-value]
 
-    def parse_layer_output(self, output: tuple) -> torch.Tensor:
+    def parse_layer_output(self, output: torch.Tensor | tuple) -> torch.Tensor:
+        # Qwen3DecoderLayer returns a bare tensor; test mocks return a tuple.
+        if isinstance(output, torch.Tensor):
+            return output  # (batch, seq, d_model)
         return output[0]  # (batch, seq, d_model)
 
     def get_num_layers(self, model: nn.Module) -> int:
@@ -103,7 +111,10 @@ class LLaMA3Adapter(ModelAdapter):
     ) -> nn.Module:
         return model.model.layers[layer_idx]  # type: ignore[return-value]
 
-    def parse_layer_output(self, output: tuple) -> torch.Tensor:
+    def parse_layer_output(self, output: torch.Tensor | tuple) -> torch.Tensor:
+        # LLaMA3DecoderLayer returns a bare tensor; test mocks return a tuple.
+        if isinstance(output, torch.Tensor):
+            return output  # (batch, seq, d_model)
         return output[0]  # (batch, seq, d_model)
 
     def get_num_layers(self, model: nn.Module) -> int:

@@ -6,8 +6,10 @@ experiment: exp4_information_purity
 
 tasks:
   - ioi
-  - factual_probing
+  - factual
   - winogrande
+
+seeds: [42]
 
 data:
   n_samples: 500
@@ -15,5 +17,7 @@ data:
 probe:
   test_size: 0.2
   max_iter: 1000
+
+layer_stride: 4     # analyse every N-th layer
 
 output_dir: outputs/results/exp4

@@ -18,6 +18,10 @@ def linear_cka(
     )
     eps = 1e-10
 
+    # Upcast to float32: teacher reps may be FP16, student FP32 after upcast.
+    X = X.float()
+    Y = Y.float()
+
     # Center representations
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
