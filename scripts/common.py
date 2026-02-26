@@ -66,6 +66,7 @@ def prepare_alignment(
     top_k: int = 20,
     diversity_ratio: float = 0.5,
     all_layer_W: bool = False,
+    extraction_batch_size: int = 4,
 ) -> tuple[list[tuple[int, int]], dict[int, int], dict[int, torch.Tensor]]:
     """Extract diffs, select checkpoints, compute CKA mapping + Procrustes.
 
@@ -76,6 +77,8 @@ def prepare_alignment(
         all_layer_W: If True, compute Procrustes W for every mapped layer pair
             (needed by FitNets). If False (default), compute only for checkpoint
             layers (sufficient for InformedFitNets / RCID).
+        extraction_batch_size: Forward-pass batch size for contrastive diff
+            extraction (prevents OOM on large datasets).
 
     Returns:
         (checkpoints, layer_mapping, W_matrices)
@@ -85,15 +88,23 @@ def prepare_alignment(
     clean = dataset.clean_ids.to(device)
     corrupt = dataset.corrupt_ids.to(device)
 
-    logger.info("Extracting teacher contrastive differences...")
-    t_diffs = extract_contrastive_differences(teacher, t_adapter, clean, corrupt, t_layers)
+    logger.info("Extracting teacher contrastive differences (batch_size=%d)...",
+                extraction_batch_size)
+    t_diffs = extract_contrastive_differences(
+        teacher, t_adapter, clean, corrupt, t_layers,
+        batch_size=extraction_batch_size,
+    )
     logger.info("Selecting causal checkpoints...")
     checkpoints = select_checkpoints(t_diffs, dataset, top_k=top_k,
                                      diversity_ratio=diversity_ratio)
     logger.info(f"Selected {len(checkpoints)} checkpoints")
 
-    logger.info("Extracting student contrastive differences...")
-    s_diffs = extract_contrastive_differences(student, s_adapter, clean, corrupt, s_layers)
+    logger.info("Extracting student contrastive differences (batch_size=%d)...",
+                extraction_batch_size)
+    s_diffs = extract_contrastive_differences(
+        student, s_adapter, clean, corrupt, s_layers,
+        batch_size=extraction_batch_size,
+    )
 
     # CKA with flattened (batch*seq, d) — retains positional information
     logger.info("Computing CKA matrix and layer mapping...")

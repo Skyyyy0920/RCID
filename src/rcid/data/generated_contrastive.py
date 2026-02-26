@@ -40,6 +40,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from rcid.circuit.contrastive import ContrastiveDataset
 
@@ -236,18 +237,22 @@ class GeneratedContrastiveDataset(ContrastiveDataset):
         corrupt_ids: torch.Tensor,  # (N, L)
         answer_pos: torch.Tensor,   # (N,)
         device: str | torch.device,
-        batch_size: int = 32,
+        batch_size: int = 4,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run teacher on clean/corrupt to get argmax token at answer_pos.
 
         Returns (correct_token_id, wrong_token_id), each shape (N,).
+        Uses small batch_size to avoid OOM with large teacher models.
         """
         n = clean_ids.shape[0]
         correct = torch.zeros(n, dtype=torch.long)
         wrong = torch.zeros(n, dtype=torch.long)
 
         teacher.eval()
-        for start in range(0, n, batch_size):
+        n_batches = (n + batch_size - 1) // batch_size
+        pbar = tqdm(range(0, n, batch_size), total=n_batches,
+                    desc="Inferring target tokens", leave=False)
+        for start in pbar:
             end = min(start + batch_size, n)
             c_batch = clean_ids[start:end].to(device)       # (B, L)
             x_batch = corrupt_ids[start:end].to(device)     # (B, L)
@@ -264,6 +269,10 @@ class GeneratedContrastiveDataset(ContrastiveDataset):
 
             correct[start:end] = c_at_ans.argmax(dim=-1).cpu()
             wrong[start:end] = x_at_ans.argmax(dim=-1).cpu()
+
+            del c_batch, x_batch, c_logits, x_logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return correct, wrong
 

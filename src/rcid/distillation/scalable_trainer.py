@@ -37,6 +37,7 @@ from tqdm import tqdm
 from rcid.circuit.contrastive import ContrastiveDataset
 from rcid.circuit.patching import extract_contrastive_differences
 from rcid.distillation.baselines import StandardKDLoss
+from rcid.distillation.padd_loss import PADDLoss
 from rcid.distillation.rcid_loss import RCIDLoss
 from rcid.models.adapter import ModelAdapter
 
@@ -93,10 +94,26 @@ class ScalableDistillationTrainer:
         self.save_every: int = cfg.get("save_every_n_epochs", 1)
         self.log_every: int = cfg.get("log_every", 50)
 
+        # ── Method routing ────────────────────────────────────────────
+        method = cfg.get("method", "standard_kd")
+        self.use_padd = method == "standard_kd_padd"
+
         # ── Loss ─────────────────────────────────────────────────────
-        self.kd_loss_fn = StandardKDLoss(
-            temperature=cfg.get("temperature", 2.0),
-        )
+        if self.use_padd:
+            self.padd_loss_fn = PADDLoss(
+                temperature=cfg.get("temperature", 2.0),
+                tau=cfg.get("padd_tau", 1.0),
+                alpha_min=cfg.get("padd_alpha_min", 0.1),
+                alpha_max=cfg.get("padd_alpha_max", 0.9),
+            )
+            self.kd_loss_fn = StandardKDLoss(
+                temperature=cfg.get("temperature", 2.0),
+            )  # kept for evaluate()
+        else:
+            self.padd_loss_fn: PADDLoss | None = None
+            self.kd_loss_fn = StandardKDLoss(
+                temperature=cfg.get("temperature", 2.0),
+            )
 
         # ── RCID ─────────────────────────────────────────────────────
         self.use_rcid = (
@@ -132,22 +149,36 @@ class ScalableDistillationTrainer:
     # ------------------------------------------------------------------
 
     def _precompute_teacher_imprints(self) -> None:
-        """Pre-compute teacher contrastive diffs at checkpoints."""
+        """Pre-compute teacher contrastive diffs at checkpoints.
+
+        Uses batched extraction (batch_size=4, pool_seq=False) to avoid OOM.
+        Only extracts layers that appear in self.checkpoints.
+        Results are stored on CPU; moved to device during _compute_rcid_loss.
+        """
         assert self.contrastive_dataset is not None
-        t_layers = list({cp[0] for cp in self.checkpoints})
+        t_layers = sorted({cp[0] for cp in self.checkpoints})
+        logger.info(
+            "Pre-computing teacher imprints: %d checkpoints, %d layers, %d samples",
+            len(self.checkpoints), len(t_layers),
+            self.contrastive_dataset.clean_ids.shape[0],
+        )
         diffs = extract_contrastive_differences(
             self.teacher, self.t_adapter,
             self.contrastive_dataset.clean_ids.to(self.device),
             self.contrastive_dataset.corrupt_ids.to(self.device),
             layers=t_layers,
-        )
+            batch_size=4,
+            pool_seq=False,  # need seq dim for position indexing
+        )  # {layer: (N, seq, d_T)} on CPU
         for t_layer, t_pos in self.checkpoints:
+            # diffs may be on CPU; index and keep on CPU (moved per-batch later)
             self.teacher_imprints[(t_layer, t_pos)] = (
                 diffs[t_layer][:, t_pos, :].detach()  # (N_rcid, d_T)
             )
+        # Free the full diffs (only imprints are needed going forward)
+        del diffs
         logger.info(
-            "Pre-computed teacher imprints: %d checkpoints, %d samples",
-            len(self.checkpoints), self.contrastive_dataset.clean_ids.shape[0],
+            "Teacher imprints ready: %d checkpoints", len(self.checkpoints),
         )
 
     # ------------------------------------------------------------------
@@ -189,14 +220,15 @@ class ScalableDistillationTrainer:
         assert self.rcid_loss_fn is not None
         clean = batch["clean_ids"].to(self.device)       # (B, seq)
         corrupt = batch["corrupt_ids"].to(self.device)    # (B, seq)
-        indices = batch["index"].to(self.device)           # (B,)
+        indices = batch["index"]                          # (B,) keep on CPU
 
         s_layers = list(set(self.layer_mapping.values()))
         s_clean_cache, _ = self._collect_student_residuals(clean, s_layers)
         s_corrupt_cache, _ = self._collect_student_residuals(corrupt, s_layers)
 
+        # Imprints live on CPU; index on CPU then move to device
         batch_imprints = {
-            key: full[indices]  # (B, d_T)
+            key: full[indices].to(self.device)  # (B, d_T)
             for key, full in self.teacher_imprints.items()
         }
         return self.rcid_loss_fn(batch_imprints, s_clean_cache, s_corrupt_cache)
@@ -238,6 +270,10 @@ class ScalableDistillationTrainer:
         history: dict[str, list[float]] = {
             "loss": [], "kl_loss": [], "rcid_loss": [],
         }
+        if self.use_padd:
+            for k in ("alpha_mean", "forward_kl_mean",
+                       "reverse_kl_mean", "teacher_entropy_mean"):
+                history[k] = []
 
         self.student.train()
         global_step = 0
@@ -247,6 +283,10 @@ class ScalableDistillationTrainer:
             epoch_kl = 0.0
             epoch_rcid = 0.0
             epoch_total = 0.0
+            epoch_padd_stats: dict[str, float] = {
+                "alpha_mean": 0.0, "forward_kl_mean": 0.0,
+                "reverse_kl_mean": 0.0, "teacher_entropy_mean": 0.0,
+            }
             n_batches = 0
 
             pbar = tqdm(
@@ -258,11 +298,20 @@ class ScalableDistillationTrainer:
                 attn_mask = main_batch["attention_mask"].to(self.device).float()  # (B, L)
 
                 # ── 1. KL loss ───────────────────────────────────────
+                padd_stats: dict[str, float] | None = None
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     with torch.no_grad():
                         t_logits = self.teacher(input_ids).logits  # (B, L, V)
                     s_logits = self.student(input_ids).logits       # (B, L, V)
-                    kl_loss = self.kd_loss_fn(t_logits, s_logits, mask=attn_mask)
+
+                    if self.use_padd and self.padd_loss_fn is not None:
+                        kl_loss, padd_stats = self.padd_loss_fn(
+                            t_logits, s_logits, mask=attn_mask,
+                        )
+                    else:
+                        kl_loss = self.kd_loss_fn(
+                            t_logits, s_logits, mask=attn_mask,
+                        )
 
                     # ── 2. RCID loss (every N steps) ─────────────────
                     rcid_loss = torch.tensor(0.0, device=self.device)
@@ -310,20 +359,33 @@ class ScalableDistillationTrainer:
                 epoch_total += total_val
                 n_batches += 1
 
-                pbar.set_postfix(
-                    kl=f"{kl_val:.4f}",
-                    rcid=f"{rcid_val:.4f}",
-                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                )
+                if padd_stats is not None:
+                    for k, v in padd_stats.items():
+                        epoch_padd_stats[k] += v
+
+                postfix: dict[str, str] = {
+                    "kl": f"{kl_val:.4f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                }
+                if padd_stats is not None:
+                    postfix["alpha"] = f"{padd_stats['alpha_mean']:.3f}"
+                else:
+                    postfix["rcid"] = f"{rcid_val:.4f}"
+                pbar.set_postfix(**postfix)
 
                 if self.use_wandb and global_step % self.log_every == 0:
                     try:
                         import wandb
-                        wandb.log({
+                        log_dict: dict[str, Any] = {
                             "kl_loss": kl_val, "rcid_loss": rcid_val,
                             "total_loss": total_val, "step": global_step,
                             "lr": self.optimizer.param_groups[0]["lr"],
-                        })
+                        }
+                        if padd_stats is not None:
+                            log_dict.update({
+                                f"padd/{k}": v for k, v in padd_stats.items()
+                            })
+                        wandb.log(log_dict)
                     except ImportError:
                         self.use_wandb = False
 
@@ -335,11 +397,26 @@ class ScalableDistillationTrainer:
             history["loss"].append(avg_total)
             history["kl_loss"].append(avg_kl)
             history["rcid_loss"].append(avg_rcid)
-            logger.info(
-                "Epoch %d/%d  kl=%.4f  rcid=%.4f  total=%.4f  lr=%.2e",
-                epoch + 1, self.epochs, avg_kl, avg_rcid, avg_total,
-                self.optimizer.param_groups[0]["lr"],
-            )
+
+            if self.use_padd:
+                for k in epoch_padd_stats:
+                    avg_v = epoch_padd_stats[k] / denom
+                    history[k].append(avg_v)
+                logger.info(
+                    "Epoch %d/%d  kl=%.4f  alpha=%.3f  fwd_kl=%.4f  "
+                    "rev_kl=%.4f  total=%.4f  lr=%.2e",
+                    epoch + 1, self.epochs, avg_kl,
+                    epoch_padd_stats["alpha_mean"] / denom,
+                    epoch_padd_stats["forward_kl_mean"] / denom,
+                    epoch_padd_stats["reverse_kl_mean"] / denom,
+                    avg_total, self.optimizer.param_groups[0]["lr"],
+                )
+            else:
+                logger.info(
+                    "Epoch %d/%d  kl=%.4f  rcid=%.4f  total=%.4f  lr=%.2e",
+                    epoch + 1, self.epochs, avg_kl, avg_rcid, avg_total,
+                    self.optimizer.param_groups[0]["lr"],
+                )
 
             # ── Checkpoint ───────────────────────────────────────────
             if save_dir and (epoch + 1) % self.save_every == 0:

@@ -104,8 +104,17 @@ def _compute_alignment(
     method: str,
     top_k: int = 10,
     diversity_ratio: float = 0.5,
+    extraction_batch_size: int = 4,
+    alignment_samples: int = 256,
+    checkpoint_samples: int = 64,
 ) -> tuple[list[tuple[int, int]], dict[int, int], dict[int, torch.Tensor]]:
     """CKA layer-matching + Procrustes W, scoped by *method*.
+
+    Uses subsampling and sequence pooling to keep memory feasible:
+      - CKA / Procrustes use ``alignment_samples`` samples with pool_seq=True
+        → each layer stores only (alignment_samples, d_model) on CPU.
+      - Checkpoint selection uses ``checkpoint_samples`` samples with full
+        sequence dimension (needs per-position norms).
 
     Returns ``(checkpoints, layer_mapping, W_matrices)``.
     """
@@ -115,53 +124,107 @@ def _compute_alignment(
     from rcid.circuit.checkpoint_selection import select_checkpoints
     from rcid.circuit.patching import extract_contrastive_differences
 
-    clean = contrastive_ds.clean_ids.to(device)     # (N, seq)
-    corrupt = contrastive_ds.corrupt_ids.to(device)  # (N, seq)
+    N = contrastive_ds.clean_ids.shape[0]
     t_layers = list(range(t_adapter.get_num_layers(teacher)))
     s_layers = list(range(s_adapter.get_num_layers(student)))
 
-    logger.info("Extracting teacher contrastive diffs (%d layers)...", len(t_layers))
-    t_diffs = extract_contrastive_differences(
-        teacher, t_adapter, clean, corrupt, t_layers,
+    # ── Random subsample indices ─────────────────────────────────────
+    perm = torch.randperm(N)
+    align_idx = perm[:min(alignment_samples, N)]
+    cp_idx = perm[:min(checkpoint_samples, N)]
+
+    logger.info(
+        "Alignment: N=%d, align_samples=%d, cp_samples=%d, batch_size=%d",
+        N, len(align_idx), len(cp_idx), extraction_batch_size,
     )
 
-    logger.info("Extracting student contrastive diffs (%d layers)...", len(s_layers))
-    s_diffs = extract_contrastive_differences(
-        student, s_adapter, clean, corrupt, s_layers,
-    )
+    # ── 1. Pooled diffs for CKA + Procrustes (small footprint) ──────
+    align_clean = contrastive_ds.clean_ids[align_idx].to(device)    # (A, seq)
+    align_corrupt = contrastive_ds.corrupt_ids[align_idx].to(device)
+
+    logger.info("Extracting teacher pooled diffs (%d layers)...", len(t_layers))
+    t_diffs_pooled = extract_contrastive_differences(
+        teacher, t_adapter, align_clean, align_corrupt, t_layers,
+        batch_size=extraction_batch_size, pool_seq=True,
+    )  # {layer: (A, d_T)} on CPU
+
+    logger.info("Extracting student pooled diffs (%d layers)...", len(s_layers))
+    s_diffs_pooled = extract_contrastive_differences(
+        student, s_adapter, align_clean, align_corrupt, s_layers,
+        batch_size=extraction_batch_size, pool_seq=True,
+    )  # {layer: (A, d_S)} on CPU
+
+    del align_clean, align_corrupt
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ── CKA + greedy layer matching ─────────────────────────────────
     logger.info("Computing CKA matrix and layer mapping...")
-    cka_scores = cka_matrix(t_diffs, s_diffs)  # auto-flattens 3D → 2D
+    cka_scores = cka_matrix(t_diffs_pooled, s_diffs_pooled)
     layer_mapping = match_layers(cka_scores=cka_scores, strategy="greedy")
 
-    # ── Checkpoint selection (rcid / informed_fitnets) ──────────────
+    # ── 2. Checkpoint selection (needs full seq dim, fewer samples) ──
     checkpoints: list[tuple[int, int]] = []
+    t_diffs_full: dict[int, torch.Tensor] = {}
+
     if method in ("standard_kd_rcid", "standard_kd_informed_fitnets"):
+        cp_clean = contrastive_ds.clean_ids[cp_idx].to(device)      # (C, seq)
+        cp_corrupt = contrastive_ds.corrupt_ids[cp_idx].to(device)
+
+        logger.info(
+            "Extracting teacher full diffs for checkpoint selection "
+            "(%d samples, %d layers)...", len(cp_idx), len(t_layers),
+        )
+        t_diffs_full = extract_contrastive_differences(
+            teacher, t_adapter, cp_clean, cp_corrupt, t_layers,
+            batch_size=extraction_batch_size, pool_seq=False,
+        )  # {layer: (C, seq, d_T)} on CPU
+
+        del cp_clean, cp_corrupt
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Build a thin wrapper dataset for the subsampled checkpoint data
+        # (select_checkpoints needs .seq_len, .is_modified, .key_positions)
+        cp_ds_proxy = _SubsampledDatasetProxy(contrastive_ds, cp_idx)
+
         logger.info("Selecting causal checkpoints (top_k=%d)...", top_k)
         checkpoints = select_checkpoints(
-            t_diffs, contrastive_ds,
+            t_diffs_full, cp_ds_proxy,
             top_k=top_k, diversity_ratio=diversity_ratio,
         )
         logger.info("Selected %d checkpoints", len(checkpoints))
 
-    # ── Procrustes W matrices ───────────────────────────────────────
+    # ── 3. Procrustes W matrices ─────────────────────────────────────
     if method == "standard_kd_fitnets":
-        # FitNets: W for every mapped layer pair
         logger.info("Computing Procrustes W for ALL mapped layers...")
-        W_matrices = compute_procrustes_matrices(t_diffs, s_diffs, layer_mapping)
+        W_matrices = compute_procrustes_matrices(
+            t_diffs_pooled, s_diffs_pooled, layer_mapping,
+        )
     else:
-        # RCID / InformedFitNets: only for checkpoint layers
         cp_t = sorted({cp[0] for cp in checkpoints})
+        t_cp = {l: t_diffs_pooled[l] for l in cp_t if l in t_diffs_pooled}
         cp_s = sorted({layer_mapping[tl] for tl in cp_t if tl in layer_mapping})
-        t_cp = {l: t_diffs[l] for l in cp_t if l in t_diffs}
-        s_cp = {l: s_diffs[l] for l in cp_s if l in s_diffs}
+        s_cp = {l: s_diffs_pooled[l] for l in cp_s if l in s_diffs_pooled}
         logger.info(
             "Computing Procrustes W for %d checkpoint layers...", len(cp_t),
         )
         W_matrices = compute_procrustes_matrices(t_cp, s_cp, layer_mapping)
 
     return checkpoints, layer_mapping, W_matrices
+
+
+class _SubsampledDatasetProxy:
+    """Thin proxy exposing `seq_len`, `is_modified`, `key_positions` for a
+    subsampled contrastive dataset so ``select_checkpoints`` works unchanged."""
+
+    def __init__(self, full_ds: Any, indices: torch.Tensor) -> None:
+        self.seq_len = full_ds.seq_len
+        self.is_modified = full_ds.is_modified
+        # Subsample key_positions tensors to match the subsampled batch
+        self.key_positions: dict[str, torch.Tensor] = {
+            k: v[indices] for k, v in full_ds.key_positions.items()
+        }
 
 
 # ------------------------------------------------------------------
