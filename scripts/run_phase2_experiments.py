@@ -1,31 +1,30 @@
-"""Phase 1 PADD (Position-Adaptive Divergence Distillation) experiment.
+"""Phase 2: AKL baseline + KL-Ratio adaptive distillation experiments.
 
-Trains a student with standard KD or PADD on instruction data, then
-evaluates on core benchmarks via lm-eval.
+Compares five methods on Alpaca-52K → Qwen3-0.6B distillation:
 
-Experiment matrix
------------------
-  standard_kd              — baseline (pure forward KL)
-  standard_kd_padd         — PADD with tau grid search
-  pure_reverse_kl          — ablation: alpha fixed to 0 (all reverse KL)
-  fixed_jsd                — ablation: alpha fixed to 0.5 (JSD)
+  1. forward_kl        — standard forward KL (baseline)
+  2. jeffreys          — fixed Jeffreys divergence (0.5 FKL + 0.5 RKL)
+  3. akl_mu0.5         — AKL (Wu et al., COLING 2025)
+  4. klr_token          — KL-Ratio per-token adaptive (ours)
+  5. klr_batch_ema      — KL-Ratio batch-level + EMA (ours)
 
 Usage::
 
-    # Single run
-    python scripts/run_padd_distill.py --method standard_kd_padd --tau 1.0
+    # Run all experiments
+    python scripts/run_phase2_experiments.py --device cuda:0
 
-    # Ablation: pure reverse KL
-    python scripts/run_padd_distill.py --method pure_reverse_kl
+    # Run specific experiments
+    python scripts/run_phase2_experiments.py --experiments akl_mu0.5,klr_token
 
-    # Ablation: fixed JSD
-    python scripts/run_padd_distill.py --method fixed_jsd
+    # Skip evaluation (training only)
+    python scripts/run_phase2_experiments.py --experiments klr_token --skip_eval
 
 Output::
 
-    outputs/padd/{model_family}/{method}/tau_{tau}/seed_{seed}/
+    outputs/phase2/{experiment_name}/
         ├── student_final.pt
-        ├── training_log.json
+        ├── training_stats.json
+        ├── eval_results.json
         └── config.json
 """
 from __future__ import annotations
@@ -58,9 +57,38 @@ MODEL_CONFIGS: dict[str, dict[str, str]] = {
     },
 }
 
-METHODS = ["standard_kd", "standard_kd_padd", "pure_reverse_kl", "fixed_jsd"]
+EVAL_BENCHMARKS = ["gsm8k", "mmlu", "arc_challenge"]
 
-EVAL_BENCHMARKS = ["mmlu", "gsm8k", "arc_challenge"]
+# ------------------------------------------------------------------
+# Experiment definitions
+# ------------------------------------------------------------------
+
+EXPERIMENTS: dict[str, dict[str, Any]] = {
+    "forward_kl": {
+        "method": "standard_kd",
+        "overrides": {},
+    },
+    "jeffreys": {
+        "method": "standard_kd_padd",
+        "overrides": {
+            "padd_tau": 1000.0,       # tau → ∞ ⇒ alpha → 0.5 ⇒ Jeffreys
+            "padd_alpha_min": 0.5,
+            "padd_alpha_max": 0.5,
+        },
+    },
+    "akl_mu0.5": {
+        "method": "standard_kd_akl",
+        "overrides": {"akl_mu": 0.5},
+    },
+    "klr_token": {
+        "method": "standard_kd_klr",
+        "overrides": {"klr_granularity": "token"},
+    },
+    "klr_batch_ema": {
+        "method": "standard_kd_klr",
+        "overrides": {"klr_granularity": "batch", "klr_beta": 0.99},
+    },
+}
 
 
 # ------------------------------------------------------------------
@@ -68,15 +96,15 @@ EVAL_BENCHMARKS = ["mmlu", "gsm8k", "arc_challenge"]
 # ------------------------------------------------------------------
 
 def run_single(
-    method: str,
+    exp_name: str,
+    exp_cfg: dict[str, Any],
+    *,
     model_family: str,
     seed: int,
     device: str,
     data_source: str,
     max_train_samples: int | None,
     output_dir: str,
-    *,
-    tau: float = 1.0,
     epochs: int = 3,
     batch_size: int = 8,
     gradient_accumulation: int = 4,
@@ -85,41 +113,21 @@ def run_single(
     temperature: float = 2.0,
     fp16: bool = True,
 ) -> dict[str, Any]:
-    """Full pipeline: load -> train -> save -> (optionally eval)."""
+    """Train one experiment configuration."""
     set_all_seeds(seed)
     mcfg = MODEL_CONFIGS[model_family]
 
-    # ── Output directory ────────────────────────────────────────────
-    if method == "standard_kd":
-        run_dir = Path(output_dir) / model_family / method / f"seed_{seed}"
-    else:
-        run_dir = (
-            Path(output_dir) / model_family / method
-            / f"tau_{tau}" / f"seed_{seed}"
-        )
+    method: str = exp_cfg["method"]
+    overrides: dict[str, Any] = exp_cfg.get("overrides", {})
+
+    run_dir = Path(output_dir) / exp_name
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Resolve PADD config ─────────────────────────────────────────
-    # pure_reverse_kl: alpha clamped to [0, 0] → always reverse KL
-    # fixed_jsd:       alpha clamped to [0.5, 0.5] → always JSD
-    # standard_kd_padd: normal adaptive alpha
-    padd_alpha_min = 0.1
-    padd_alpha_max = 0.9
-    trainer_method = method
-
-    if method == "pure_reverse_kl":
-        padd_alpha_min = 0.0
-        padd_alpha_max = 0.0
-        trainer_method = "standard_kd_padd"  # reuse PADD path
-    elif method == "fixed_jsd":
-        padd_alpha_min = 0.5
-        padd_alpha_max = 0.5
-        trainer_method = "standard_kd_padd"
 
     # ── Save config.json ────────────────────────────────────────────
     run_config: dict[str, Any] = {
+        "experiment": exp_name,
         "method": method,
-        "trainer_method": trainer_method,
+        "overrides": overrides,
         "model_family": model_family,
         "teacher": mcfg["teacher"],
         "student": mcfg["student"],
@@ -132,9 +140,6 @@ def run_single(
         "effective_batch_size": batch_size * gradient_accumulation,
         "lr": lr,
         "temperature": temperature,
-        "padd_tau": tau,
-        "padd_alpha_min": padd_alpha_min,
-        "padd_alpha_max": padd_alpha_max,
         "max_seq_len": max_seq_len,
         "fp16": fp16,
         "device": device,
@@ -151,18 +156,18 @@ def run_single(
     # ── Instruction dataset ─────────────────────────────────────────
     from rcid.data.instruction_dataset import InstructionDataset
 
-    logger.info("Loading instruction data: %s (max=%s)", data_source, max_train_samples)
+    logger.info("Loading data: %s (max=%s)", data_source, max_train_samples)
     main_ds = InstructionDataset(
         dataset_name=data_source,
         tokenizer=tokenizer,
         max_seq_len=max_seq_len,
         max_samples=max_train_samples,
     )
-    logger.info("Instruction dataset: %d samples", len(main_ds))
+    logger.info("Dataset: %d samples", len(main_ds))
 
     # ── Build trainer config ────────────────────────────────────────
     trainer_cfg: dict[str, Any] = {
-        "method": trainer_method,
+        "method": method,
         "epochs": epochs,
         "batch_size": batch_size,
         "gradient_accumulation": gradient_accumulation,
@@ -172,17 +177,14 @@ def run_single(
         "warmup_ratio": 0.03,
         "fp16": fp16,
         "temperature": temperature,
-        "lambda_rcid": 0.0,  # no RCID in PADD experiments
+        "lambda_rcid": 0.0,
         "save_every_n_epochs": 1,
         "use_wandb": False,
         "log_every": 50,
-        # PADD-specific
-        "padd_tau": tau,
-        "padd_alpha_min": padd_alpha_min,
-        "padd_alpha_max": padd_alpha_max,
     }
+    trainer_cfg.update(overrides)
 
-    # ── Create trainer and train ────────────────────────────────────
+    # ── Train ───────────────────────────────────────────────────────
     from rcid.distillation.scalable_trainer import ScalableDistillationTrainer
 
     trainer = ScalableDistillationTrainer(
@@ -195,28 +197,26 @@ def run_single(
     )
 
     logger.info(
-        "Training: method=%s  tau=%.2f  epochs=%d  batch=%dx%d  lr=%.2e",
-        method, tau, epochs, batch_size, gradient_accumulation, lr,
+        "Training: exp=%s  method=%s  epochs=%d  batch=%dx%d  lr=%.2e",
+        exp_name, method, epochs, batch_size, gradient_accumulation, lr,
     )
     t0 = time.time()
     history = trainer.train(save_dir=str(run_dir))
     train_secs = time.time() - t0
     logger.info("Training complete in %.1f s", train_secs)
 
-    # ── Evaluate (KL on main data) ──────────────────────────────────
     eval_metrics = trainer.evaluate()
 
-    # ── Save student_final.pt ───────────────────────────────────────
+    # ── Save checkpoint ─────────────────────────────────────────────
     final_ckpt = run_dir / "student_final.pt"
     torch.save(student.state_dict(), final_ckpt)
     logger.info("Final checkpoint: %s", final_ckpt)
 
-    # ── Save training_log.json ──────────────────────────────────────
-    training_log: dict[str, Any] = {
+    # ── Save training_stats.json ────────────────────────────────────
+    training_stats: dict[str, Any] = {
+        "experiment": exp_name,
         "method": method,
-        "model_family": model_family,
         "seed": seed,
-        "tau": tau,
         "train_time_sec": round(train_secs, 1),
         "n_samples": len(main_ds),
         "history": history,
@@ -224,10 +224,10 @@ def run_single(
         "final_loss": history["loss"][-1] if history.get("loss") else None,
         "checkpoint_path": str(final_ckpt),
     }
-    with open(run_dir / "training_log.json", "w", encoding="utf-8") as f:
-        json.dump(training_log, f, indent=2)
+    with open(run_dir / "training_stats.json", "w", encoding="utf-8") as f:
+        json.dump(training_stats, f, indent=2)
 
-    return training_log
+    return training_stats
 
 
 # ------------------------------------------------------------------
@@ -237,20 +237,22 @@ def run_single(
 def run_eval(
     model_name: str,
     model_path: str,
+    output_dir: str,
     benchmarks: list[str],
     device: str,
-    batch_size: int = 16,
+    batch_size: int = 4,
 ) -> dict[str, Any]:
-    """Run lm-eval on a saved checkpoint via the eval_benchmarks script."""
+    """Run lm-eval and save results to output_dir/eval_results.json."""
     script = Path(__file__).resolve().parent / "eval_benchmarks.py"
-    bench_str = ",".join(benchmarks)
+    out_json = str(Path(output_dir) / "eval_results.json")
     cmd = [
         sys.executable, str(script),
         "--model_name", model_name,
         "--model_path", model_path,
-        "--benchmarks", bench_str,
+        "--benchmarks", ",".join(benchmarks),
         "--device", device,
         "--batch_size", str(batch_size),
+        "--output_path", out_json,
     ]
     logger.info("Running lm-eval: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -258,12 +260,10 @@ def run_eval(
         logger.error("lm-eval failed:\n%s", proc.stderr[-500:])
         return {"error": proc.stderr[-300:]}
 
-    # Parse the output JSON saved by eval_benchmarks.py
-    results_path = Path(model_path).parent / "benchmark_results.json"
-    if results_path.exists():
-        with open(results_path, "r", encoding="utf-8") as f:
+    if Path(out_json).exists():
+        with open(out_json, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"error": "benchmark_results.json not found"}
+    return {"error": "eval_results.json not found"}
 
 
 # ------------------------------------------------------------------
@@ -271,10 +271,12 @@ def run_eval(
 # ------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="PADD Phase 1 experiment")
-    ap.add_argument("--method", choices=METHODS, default="standard_kd_padd")
-    ap.add_argument("--tau", type=float, default=1.0, help="PADD tau")
-    ap.add_argument("--model_family", choices=["qwen3", "llama3"], default="qwen3")
+    ap = argparse.ArgumentParser(description="Phase 2 experiments")
+    ap.add_argument(
+        "--experiments", default="all",
+        help="Comma-separated experiment names, or 'all' (default: all)",
+    )
+    ap.add_argument("--model_family", default="qwen3", choices=["qwen3", "llama3"])
     ap.add_argument("--data_source", default="tatsu-lab/alpaca")
     ap.add_argument("--max_train_samples", type=int, default=52000)
     ap.add_argument("--epochs", type=int, default=3)
@@ -284,15 +286,12 @@ def main() -> None:
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--output_dir", default="outputs/padd")
+    ap.add_argument("--output_dir", default="outputs/phase2")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--no_fp16", dest="fp16", action="store_false")
-    ap.add_argument(
-        "--skip_eval", action="store_true",
-        help="Skip lm-eval after training",
-    )
-    ap.add_argument("--eval_batch_size", type=int, default=16)
+    ap.add_argument("--skip_eval", action="store_true")
+    ap.add_argument("--eval_batch_size", type=int, default=4)
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -300,44 +299,67 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logger.info(
-        "=== PADD Phase 1: method=%s  tau=%.2f  seed=%d ===",
-        args.method, args.tau, args.seed,
-    )
 
-    result = run_single(
-        method=args.method,
-        model_family=args.model_family,
-        seed=args.seed,
-        device=args.device,
-        data_source=args.data_source,
-        max_train_samples=args.max_train_samples,
-        output_dir=args.output_dir,
-        tau=args.tau,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        gradient_accumulation=args.gradient_accumulation,
-        lr=args.lr,
-        max_seq_len=args.max_seq_len,
-        temperature=args.temperature,
-        fp16=args.fp16,
-    )
-    logger.info(
-        "Training done. time=%.1fs  final_loss=%s",
-        result["train_time_sec"], result["final_loss"],
-    )
+    # Resolve experiment list
+    if args.experiments == "all":
+        exp_names = list(EXPERIMENTS.keys())
+    else:
+        exp_names = [e.strip() for e in args.experiments.split(",")]
+        for e in exp_names:
+            if e not in EXPERIMENTS:
+                logger.error("Unknown experiment: %s. Available: %s", e,
+                             list(EXPERIMENTS.keys()))
+                sys.exit(1)
 
-    # ── Benchmark evaluation ────────────────────────────────────────
-    if not args.skip_eval:
-        mcfg = MODEL_CONFIGS[args.model_family]
-        eval_result = run_eval(
-            model_name=mcfg["student"],
-            model_path=result["checkpoint_path"],
-            benchmarks=EVAL_BENCHMARKS,
+    logger.info("=== Phase 2: %d experiments ===", len(exp_names))
+    mcfg = MODEL_CONFIGS[args.model_family]
+
+    for exp_name in exp_names:
+        exp_cfg = EXPERIMENTS[exp_name]
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("  Experiment: %s", exp_name)
+        logger.info("=" * 60)
+
+        result = run_single(
+            exp_name=exp_name,
+            exp_cfg=exp_cfg,
+            model_family=args.model_family,
+            seed=args.seed,
             device=args.device,
-            batch_size=args.eval_batch_size,
+            data_source=args.data_source,
+            max_train_samples=args.max_train_samples,
+            output_dir=args.output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            gradient_accumulation=args.gradient_accumulation,
+            lr=args.lr,
+            max_seq_len=args.max_seq_len,
+            temperature=args.temperature,
+            fp16=args.fp16,
         )
-        logger.info("Eval results: %s", json.dumps(eval_result, indent=2))
+        logger.info(
+            "  Training done: time=%.1fs  final_loss=%s",
+            result["train_time_sec"], result["final_loss"],
+        )
+
+        if not args.skip_eval:
+            run_dir = Path(args.output_dir) / exp_name
+            eval_res = run_eval(
+                model_name=mcfg["student"],
+                model_path=result["checkpoint_path"],
+                output_dir=str(run_dir),
+                benchmarks=EVAL_BENCHMARKS,
+                device=args.device,
+                batch_size=args.eval_batch_size,
+            )
+            logger.info("  Eval: %s", json.dumps(
+                {k: v for k, v in eval_res.get("results", {}).items()},
+                indent=2,
+            ))
+
+    logger.info("")
+    logger.info("=== Phase 2 complete. Results in: %s ===", args.output_dir)
 
 
 if __name__ == "__main__":

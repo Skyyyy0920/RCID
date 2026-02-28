@@ -1,3 +1,3 @@
-"""Cross-model alignment: CKA, layer matching, Procrustes."""
+"""Cross-model alignment (unused in KL-Ratio project)."""
 
 __all__: list[str] = []

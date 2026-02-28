@@ -1,3 +1,3 @@
-"""Circuit analysis: patching, intervention, checkpoint selection."""
+"""Circuit analysis: contrastive dataset base class."""
 
 __all__: list[str] = []

@@ -1,3 +1,3 @@
-"""Evaluation metrics: causal consistency, accuracy, perplexity, OOD, purity."""
+"""Evaluation metrics: perplexity."""
 
 __all__: list[str] = []

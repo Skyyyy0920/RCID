@@ -11,7 +11,6 @@ from rcid.distillation.baselines import (
     InformedFitNetsLoss,
     StandardKDLoss,
 )
-from rcid.distillation.rcid_loss import RCIDLoss
 from rcid.distillation.trainer import UnifiedTrainer
 
 
@@ -65,74 +64,6 @@ class TestStandardKDLoss:
         loss = StandardKDLoss()(t_logits, s_logits)
         loss.backward()
         assert s_logits.grad is not None
-
-
-# ---------------------------------------------------------------------------
-# RCID loss tests
-# ---------------------------------------------------------------------------
-
-class TestRCIDLoss:
-    @pytest.fixture
-    def setup(self):
-        d_T, d_S = 64, 16
-        checkpoints = [(0, 3), (2, 5)]
-        layer_mapping = {0: 0, 2: 1}
-        W = {0: torch.eye(d_T, d_S), 2: torch.eye(d_T, d_S)}
-        loss_fn = RCIDLoss(checkpoints, layer_mapping, W)
-        return loss_fn, d_T, d_S, checkpoints
-
-    def test_output_is_scalar(self, setup) -> None:
-        loss_fn, d_T, d_S, checkpoints = setup
-        teacher_imprints = {
-            (0, 3): torch.randn(4, d_T),
-            (2, 5): torch.randn(4, d_T),
-        }
-        s_clean = {0: torch.randn(4, 10, d_S), 1: torch.randn(4, 10, d_S)}
-        s_corrupt = {0: torch.randn(4, 10, d_S), 1: torch.randn(4, 10, d_S)}
-        loss = loss_fn(teacher_imprints, s_clean, s_corrupt)
-        assert loss.dim() == 0
-        assert loss.isfinite()
-
-    def test_gradient_only_through_student(self, setup) -> None:
-        loss_fn, d_T, d_S, checkpoints = setup
-        teacher_imprints = {
-            (0, 3): torch.randn(4, d_T),  # detached
-            (2, 5): torch.randn(4, d_T),
-        }
-        s_clean = {
-            0: torch.randn(4, 10, d_S, requires_grad=True),
-            1: torch.randn(4, 10, d_S, requires_grad=True),
-        }
-        s_corrupt = {
-            0: torch.randn(4, 10, d_S, requires_grad=True),
-            1: torch.randn(4, 10, d_S, requires_grad=True),
-        }
-        loss = loss_fn(teacher_imprints, s_clean, s_corrupt)
-        loss.backward()
-        for layer in s_clean.values():
-            assert layer.grad is not None
-        for layer in s_corrupt.values():
-            assert layer.grad is not None
-
-    def test_near_zero_when_aligned(self) -> None:
-        """If student diffs == teacher diffs (with identity W), loss ≈ 0."""
-        d = 16
-        checkpoints = [(0, 2)]
-        layer_mapping = {0: 0}
-        W = {0: torch.eye(d, d)}
-        loss_fn = RCIDLoss(checkpoints, layer_mapping, W)
-
-        t_diff = torch.randn(4, d)
-        t_diff = t_diff / t_diff.norm(dim=-1, keepdim=True)
-
-        # Construct student residuals so that d_S = t_diff
-        s_clean = {0: torch.zeros(4, 5, d)}
-        s_corrupt = {0: torch.zeros(4, 5, d)}
-        s_clean[0][:, 2, :] = t_diff
-        # s_corrupt stays zero, so d_S = s_clean - s_corrupt = t_diff
-
-        loss = loss_fn({(0, 2): t_diff}, s_clean, s_corrupt)
-        assert loss.item() < 1e-4, f"Expected near-zero loss, got {loss.item()}"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +132,10 @@ class TestUnifiedTrainer:
             is_modified={"s2": True},
             model_family="test",
         )
-        config = {"epochs": 2, "batch_size": 4, "lr": 1e-3, "fp16": False, "kl_mode": "sequence"}
+        config = {
+            "epochs": 2, "batch_size": 4, "lr": 1e-3,
+            "fp16": False, "kl_mode": "sequence",
+        }
         return teacher, student, adapter, ds, config
 
     def test_standard_kd_trains(self, tiny_setup) -> None:
@@ -215,23 +149,6 @@ class TestUnifiedTrainer:
         history = trainer.train()
         assert len(history["loss"]) == 2
         assert all(l > 0 for l in history["loss"])
-
-    def test_rcid_trains(self, tiny_setup) -> None:
-        teacher, student, adapter, ds, config = tiny_setup
-        checkpoints = [(2, 3)]
-        layer_mapping = {2: 2}
-        W = {2: torch.eye(32, 32)}
-        trainer = UnifiedTrainer(
-            method="rcid",
-            teacher=teacher, student=student,
-            teacher_adapter=adapter, student_adapter=adapter,
-            dataset=ds, config=config,
-            checkpoints=checkpoints,
-            layer_mapping=layer_mapping,
-            W_matrices=W,
-        )
-        history = trainer.train()
-        assert len(history["loss"]) == 2
 
     def test_teacher_not_updated(self, tiny_setup) -> None:
         teacher, student, adapter, ds, config = tiny_setup
