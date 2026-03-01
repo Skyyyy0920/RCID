@@ -1,19 +1,23 @@
 """Instruction dataset for large-scale sequence-level KL distillation.
 
-Loads instruction-tuning data (Alpaca, SlimOrca, etc.) from HuggingFace,
-tokenises each sample into a single sequence, and provides masks that
-distinguish prompt tokens from response tokens so that the KL loss can
-be applied selectively.
+Loads instruction-tuning data (Alpaca, Dolly, SlimOrca, etc.) from
+HuggingFace, tokenises each sample into a single sequence, and provides
+masks that distinguish prompt tokens from response tokens so that the KL
+loss can be applied selectively.
+
+Dolly-15K receives special handling: its train/val/test splits are
+obtained from :func:`rcid.data.dolly_utils.split_dolly_dataset` to
+guarantee identical partitions everywhere.
 
 Usage::
 
     from rcid.data.instruction_dataset import InstructionDataset
 
     ds = InstructionDataset(
-        dataset_name="tatsu-lab/alpaca",
+        dataset_name="databricks/databricks-dolly-15k",
         tokenizer=tokenizer,
         max_seq_len=512,
-        max_samples=10000,
+        split="train",
     )
     loader = DataLoader(ds, batch_size=8, collate_fn=ds.collate_fn)
 """
@@ -100,10 +104,27 @@ def _format_chat(sample: dict[str, Any]) -> tuple[str, str]:
     return prompt, full
 
 
+def _format_dolly(sample: dict[str, Any]) -> tuple[str, str]:
+    """Return (prompt, full_text) for a Dolly-format sample."""
+    from rcid.data.dolly_utils import format_dolly_prompt
+
+    instruction = sample.get("instruction", "")
+    context = sample.get("context", "")
+    response = sample.get("response", "")
+
+    prompt = format_dolly_prompt(instruction, context)
+    full = prompt + response
+    return prompt, full
+
+
 def _detect_and_format(sample: dict[str, Any]) -> tuple[str, str]:
     """Auto-detect format and return (prompt, full_text)."""
+    if "instruction" in sample and "output" in sample:
+        return _format_alpaca(sample)       # Alpaca: has 'output' field
+    if "instruction" in sample and "response" in sample:
+        return _format_dolly(sample)        # Dolly: has 'response' field
     if "instruction" in sample:
-        return _format_alpaca(sample)
+        return _format_alpaca(sample)       # Fallback for instruction-only
     if "conversations" in sample:
         return _format_chat(sample)
     # Fallback: use any available text field as both prompt and full
@@ -143,9 +164,17 @@ class InstructionDataset(Dataset):
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.pad_id = pad_id
 
-        # Load from HuggingFace
+        # Load from HuggingFace — Dolly uses fixed splits
         from datasets import load_dataset
-        raw = load_dataset(dataset_name, split=split)
+        if "dolly" in dataset_name.lower():
+            from rcid.data.dolly_utils import split_dolly_dataset
+            all_splits = split_dolly_dataset(seed=42)
+            raw = all_splits.get(split, all_splits["train"])
+            logger.info(
+                "Using Dolly fixed split: %s (%d samples)", split, len(raw),
+            )
+        else:
+            raw = load_dataset(dataset_name, split=split)
         if max_samples is not None and len(raw) > max_samples:
             raw = raw.select(range(max_samples))
         logger.info("Loaded %d samples from %s/%s", len(raw), dataset_name, split)

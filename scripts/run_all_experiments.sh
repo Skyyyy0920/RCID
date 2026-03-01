@@ -80,9 +80,9 @@ echo ""
 echo "===== Part 3: Summary + Figures ====="
 python "${SCRIPT_DIR}/plot_paper_figures.py" --output_dir "$OUTPUT_DIR" || true
 
-# Print summary table
+# Print summary table (ROUGE-L on Dolly test split)
 echo ""
-echo "===== Results Summary ====="
+echo "===== Results Summary (ROUGE-L on Dolly test) ====="
 python -c "
 import json, glob, os
 
@@ -91,24 +91,19 @@ for f in sorted(glob.glob('${OUTPUT_DIR}/*/eval_results.json')):
     name = os.path.basename(os.path.dirname(f))
     with open(f) as fh:
         data = json.load(fh)
-    results[name] = data.get('results', {})
+    results[name] = data
 
-print('Method              | GSM8K  | MMLU   | ARC-C  | HellaS | WinoG  | TQA-MC2| Avg')
-print('-' * 95)
+print('Method              | ROUGE-L F | ROUGE-L P | ROUGE-L R')
+print('-' * 60)
 order = ['forward_kl', 'reverse_kl', 'jeffreys', 'akl',
          'klr_token', 'klr_batch_ema',
          'klr_no_ema', 'klr_beta_0.9', 'klr_beta_0.95', 'klr_beta_0.999']
 for name in order:
     r = results.get(name, {})
-    gsm = r.get('gsm8k', {}).get('score', 0)
-    mmlu = r.get('mmlu', {}).get('score', 0)
-    arc = r.get('arc_challenge', {}).get('score', 0)
-    hella = r.get('hellaswag', {}).get('score', 0)
-    wino = r.get('winogrande', {}).get('score', 0)
-    tqa = r.get('truthfulqa_mc2', {}).get('score', 0)
-    scores = [gsm, mmlu, arc, hella, wino, tqa]
-    avg = sum(scores) / len(scores) if any(s > 0 for s in scores) else 0
-    print(f'{name:20s}| {gsm*100:6.2f} | {mmlu*100:6.2f} | {arc*100:6.2f} | {hella*100:6.2f} | {wino*100:6.2f} | {tqa*100:6.2f} | {avg*100:.2f}')
+    f1 = r.get('rouge_l_f', 0)
+    p = r.get('rouge_l_p', 0)
+    rec = r.get('rouge_l_r', 0)
+    print(f'{name:20s}| {f1*100:9.2f} | {p*100:9.2f} | {rec*100:9.2f}')
 " || echo "(summary failed, check individual eval_results.json)"
 
 echo ""

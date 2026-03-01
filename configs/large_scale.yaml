@@ -1,5 +1,5 @@
 # Large-scale distillation configuration
-# Standard KD + RCID regularizer on real benchmarks
+# Adaptive KL methods on Dolly-15K
 
 experiment: large_scale_distillation
 
@@ -8,22 +8,15 @@ model_family: qwen3
 teacher: Qwen/Qwen3-8B
 student: Qwen/Qwen3-0.6B
 
-# Main training data
+# === Data ===
 data:
-  source: tatsu-lab/alpaca
-  max_samples: 52000
+  source: "databricks/databricks-dolly-15k"
+  dataset_seed: 42
   max_seq_len: 512
 
-# Contrastive pairs (for RCID / FitNets / InformedFitNets)
-# Per-task generation: each generator has independent quota and output file
+# === Contrastive Pairs (for potential RCID regulariser) ===
 contrastive:
-  # Directory containing per-task JSONs (e.g. entity_swap.json, number_perturb.json)
   pairs_dir: data/contrastive_pairs/
-  # Legacy single-file path (used if pairs_dir does not exist)
-  pairs_path_legacy: data/contrastive_pairs.json
-  # Which task types to load (null = load all .json files in pairs_dir)
-  task_types: null  # e.g. [entity_swap, number_perturb]
-
   # Per-generator generation settings
   generators:
     entity_swap:
@@ -35,12 +28,9 @@ contrastive:
     llm:
       enabled: false
       max_pairs: 2500
+  data_source: "databricks/databricks-dolly-15k"
 
-  # Generation data source
-  data_source: tatsu-lab/alpaca
-  max_samples: 10000
-
-# Training
+# === Training ===
 training:
   epochs: 3
   batch_size: 8
@@ -57,27 +47,22 @@ kl:
   temperature: 2.0
   mode: sequence  # "sequence" or "answer_only"
 
-# RCID regularizer
-rcid:
-  enabled: true
-  lambda: 0.1
-  every_n_steps: 5
-  top_k_checkpoints: 20
-
-# Evaluation benchmarks
-eval:
-  benchmarks:
-    - mmlu
-    - gsm8k
-    - arc_challenge
-    - hellaswag
-    - winogrande
-    - truthfulqa
+# === Evaluation ===
+evaluation:
+  eval_dataset: "databricks/databricks-dolly-15k"
+  eval_split: "val"        # training-time validation
+  test_split: "test"       # final evaluation
+  eval_samples: 500
+  eval_metric: "rouge_l"   # primary metric
+  max_new_tokens: 256
+  eval_batch_size: 8
 
 # Methods to compare
 methods:
   - standard_kd
-  - standard_kd_rcid
+  - reverse_kl
+  - standard_kd_akl
+  - standard_kd_klr
 
 seeds: [42, 123, 456]
 

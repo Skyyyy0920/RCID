@@ -1,6 +1,6 @@
 """Paper experiments: unified entry point for all KL-Ratio experiments.
 
-Runs training + lm-eval evaluation for a single named experiment.
+Runs training on Dolly-15K + ROUGE-L evaluation on Dolly test split.
 
 Usage::
 
@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -108,8 +107,8 @@ EXPERIMENT_CONFIGS: dict[str, dict[str, Any]] = {
 TRAINING_DEFAULTS: dict[str, Any] = {
     "teacher_model": "Qwen/Qwen3-8B",
     "student_model": "Qwen/Qwen3-0.6B",
-    "dataset": "tatsu-lab/alpaca",
-    "max_train_samples": 52000,
+    "dataset": "databricks/databricks-dolly-15k",
+    "max_train_samples": None,  # Use full Dolly train split (~14k)
     "epochs": 3,
     "batch_size": 8,
     "gradient_accumulation": 4,
@@ -121,11 +120,7 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     "seed": 42,
 }
 
-EVAL_BENCHMARKS = [
-    "gsm8k", "mmlu", "arc_challenge",
-    "hellaswag", "winogrande", "truthfulqa_mc2",
-]
-EVAL_BATCH_SIZE = 4
+EVAL_BATCH_SIZE = 8
 
 
 # ------------------------------------------------------------------
@@ -247,7 +242,7 @@ def run_training(
 
 
 # ------------------------------------------------------------------
-# Evaluation (lm-eval)
+# Evaluation (ROUGE-L on Dolly test split)
 # ------------------------------------------------------------------
 
 def run_eval(
@@ -255,34 +250,49 @@ def run_eval(
     student_model: str,
     checkpoint_path: str,
     output_dir: str,
-    benchmarks: list[str],
     device: str,
-    batch_size: int = 4,
+    batch_size: int = 8,
 ) -> dict[str, Any]:
-    """Run lm-eval-harness and save eval_results.json."""
-    script = Path(__file__).resolve().parent / "eval_benchmarks.py"
+    """Evaluate checkpoint with ROUGE-L on Dolly test split."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from rcid.data.dolly_utils import get_dolly_prompts
+    from rcid.eval.rouge_eval import evaluate_rouge, save_generations
+
     run_dir = Path(output_dir) / exp_name
-    out_json = str(run_dir / "eval_results.json")
 
-    cmd = [
-        sys.executable, str(script),
-        "--model_name", student_model,
-        "--model_path", checkpoint_path,
-        "--benchmarks", ",".join(benchmarks),
-        "--device", device,
-        "--batch_size", str(batch_size),
-        "--output_path", out_json,
-    ]
-    logger.info("Running lm-eval: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if proc.returncode != 0:
-        logger.error("lm-eval failed:\n%s", proc.stderr[-500:])
-        return {"error": proc.stderr[-300:]}
+    logger.info("Loading student for eval: %s", student_model)
+    tokenizer = AutoTokenizer.from_pretrained(student_model)
+    model = AutoModelForCausalLM.from_pretrained(
+        student_model, torch_dtype=torch.float16,
+    ).to(device)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.eval()
 
-    if Path(out_json).exists():
-        with open(out_json, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"error": "eval_results.json not found"}
+    eval_prompts, eval_refs = get_dolly_prompts(split="test")
+    logger.info("Evaluating ROUGE-L on %d Dolly test samples...", len(eval_prompts))
+
+    results = evaluate_rouge(
+        model, tokenizer, eval_prompts, eval_refs,
+        max_new_tokens=256, batch_size=batch_size,
+    )
+    logger.info("Test ROUGE-L: %.4f", results["rouge_l_f"])
+
+    # Save eval results (without full generations list)
+    out_json = run_dir / "eval_results.json"
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {k: v for k, v in results.items() if k != "generations"},
+            f, indent=2,
+        )
+
+    # Save generations for inspection
+    save_generations(
+        eval_prompts, results["generations"], eval_refs,
+        filepath=str(run_dir / "test_generations.json"),
+        rouge_scores=results.get("per_sample_rouge_l_f"),
+    )
+
+    return results
 
 
 # ------------------------------------------------------------------
@@ -300,11 +310,11 @@ def main() -> None:
     ap.add_argument("--output_dir", default="outputs/paper")
     ap.add_argument(
         "--eval_only", action="store_true",
-        help="Skip training, only run lm-eval on existing checkpoint",
+        help="Skip training, only run ROUGE-L eval on existing checkpoint",
     )
     ap.add_argument(
         "--skip_eval", action="store_true",
-        help="Skip lm-eval after training",
+        help="Skip ROUGE-L eval after training",
     )
     ap.add_argument("--eval_batch_size", type=int, default=EVAL_BATCH_SIZE)
     args = ap.parse_args()
@@ -336,7 +346,7 @@ def main() -> None:
             result["train_time_sec"], result["final_loss"],
         )
 
-    # ── Evaluation ────────────────────────────────────────────────
+    # ── Evaluation (ROUGE-L on Dolly test split) ────────────────
     if not args.skip_eval:
         ckpt = run_dir / "student_final.pt"
         if not ckpt.exists():
@@ -348,14 +358,15 @@ def main() -> None:
             student_model=TRAINING_DEFAULTS["student_model"],
             checkpoint_path=str(ckpt),
             output_dir=args.output_dir,
-            benchmarks=EVAL_BENCHMARKS,
             device=args.device,
             batch_size=args.eval_batch_size,
         )
-        logger.info("Eval results: %s", json.dumps(
-            {k: v for k, v in eval_res.get("results", {}).items()},
-            indent=2,
-        ))
+        logger.info(
+            "ROUGE-L: F=%.4f  P=%.4f  R=%.4f",
+            eval_res.get("rouge_l_f", 0),
+            eval_res.get("rouge_l_p", 0),
+            eval_res.get("rouge_l_r", 0),
+        )
 
     logger.info("Done: %s", exp_name)
 

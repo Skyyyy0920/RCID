@@ -20,6 +20,7 @@ dependencies = [
     "seaborn>=0.13",
     "pytest>=7.4",
     "tqdm>=4.66",
+    "rouge-score>=0.1.2",
 ]
 
 [project.optional-dependencies]
