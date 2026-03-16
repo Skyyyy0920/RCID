@@ -437,26 +437,30 @@ class ScalableDistillationTrainer:
                         )  # (B, max_len)
 
                         # Compute student saliency on the fly
+                        # create_graph=True so L_sal gradients flow to student params
                         s_sal = self.saliency_computer.compute(
                             self.student, ids, mask.long(), labels_mask_b,
+                            create_graph=True,
                         )
 
                         # Convert to distributions → JSD → weights
+                        # Detach s_sal for JSD/weights: only L_sal needs
+                        # gradient through saliency, weights are detached anyway
                         t_dist = self.saliency_computer.to_distribution(
-                            t_sal, labels_mask_b)
+                            t_sal, labels_mask_b, attention_mask=mask.long())
                         s_dist = self.saliency_computer.to_distribution(
-                            s_sal, labels_mask_b)
+                            s_sal.detach(), labels_mask_b, attention_mask=mask.long())
                         jsd = self.saliency_computer.divergence(
                             t_dist, s_dist, labels_mask_b)  # (B,)
                         weights = F.softmax(
                             jsd / self.sagd_tau_w, dim=0) * B_cur  # mean=1
 
-                        # Per-sample KL with reweighting
-                        # logit[j] predicts token[j+1], so shift labels_mask
-                        shifted_resp = torch.zeros_like(labels_mask_b, dtype=torch.float)
-                        shifted_resp[:, :-1] = labels_mask_b[:, 1:].float()
+                        # Per-sample full-sequence KL with reweighting
+                        # logit[j] predicts token[j+1], shift attention_mask
+                        shifted_mask = torch.zeros_like(mask)
+                        shifted_mask[:, :-1] = mask[:, 1:]
                         per_sample_kl = self._compute_per_sample_kl(
-                            t_logits, s_logits, shifted_resp)  # (B,)
+                            t_logits, s_logits, shifted_mask)  # (B,)
                         kl_loss = (weights.detach() * per_sample_kl).mean()
 
                         # Saliency alignment loss (first-order matching term)

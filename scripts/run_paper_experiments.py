@@ -127,8 +127,9 @@ EXPERIMENT_CONFIGS: dict[str, dict[str, Any]] = {
         "teacher_saliency_path": "data/teacher_saliency_qwen3.pt",
         "sagd_every_n_steps": 1,
         "sagd_tau_w": 0.1,
+        "lambda_sal": 0.0,
         "saliency_temperature": 2.0,
-        "description": "SaGD ablation: aggressive reweighting (tau_w=0.1)",
+        "description": "SaGD ablation: reweighting only, no L_sal (tau_w=0.1, lambda_sal=0)",
     },
 }
 

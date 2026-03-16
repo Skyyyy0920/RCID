@@ -13,7 +13,7 @@ Usage::
 
     computer = SaliencyComputer(temperature=2.0)
     saliency = computer.compute(model, input_ids, attention_mask, labels_mask)
-    dist = computer.to_distribution(saliency, labels_mask)
+    dist = computer.to_distribution(saliency, labels_mask, attention_mask)
     jsd = computer.divergence(dist_T, dist_S, labels_mask)
 """
 
@@ -55,8 +55,15 @@ class SaliencyComputer:
         input_ids: torch.Tensor,       # (B, L)
         attention_mask: torch.Tensor,   # (B, L)
         labels_mask: torch.Tensor,      # (B, L) — 1=response, 0=prompt/pad
+        create_graph: bool = False,
     ) -> torch.Tensor:
         """Compute per-position saliency for each sample.
+
+        Args:
+            create_graph: If True, the returned saliency retains a computation
+                graph so that losses computed from it can backpropagate to model
+                parameters (second-order gradient).  Use True for student
+                saliency during training; False for teacher precomputation.
 
         Returns:
             saliency: (B, L) — L2 norm of embedding gradient at each position.
@@ -73,17 +80,21 @@ class SaliencyComputer:
         else:
             raise AttributeError("Cannot find embedding layer on model")
 
-        # Temporarily freeze model parameters so backward only flows to embed
+        # Freeze model params only when not differentiable (teacher path)
         param_states: list[tuple[nn.Parameter, bool]] = []
-        for p in model.parameters():
-            param_states.append((p, p.requires_grad))
-            p.requires_grad_(False)
+        if not create_graph:
+            for p in model.parameters():
+                param_states.append((p, p.requires_grad))
+                p.requires_grad_(False)
 
         try:
-            # Create detached embedding as leaf tensor for gradient
-            with torch.no_grad():
-                embed = embed_layer(input_ids)  # (B, L, d_model)
-            embed = embed.detach().requires_grad_(True)
+            # Embedding: detached leaf (teacher) vs connected (student)
+            if create_graph:
+                embed = embed_layer(input_ids)  # (B, L, d_model) — connected
+            else:
+                with torch.no_grad():
+                    embed = embed_layer(input_ids)  # (B, L, d_model)
+                embed = embed.detach().requires_grad_(True)
 
             # Forward pass using inputs_embeds
             outputs = model(
@@ -104,23 +115,31 @@ class SaliencyComputer:
             # Sum log-probs over response positions
             response_ll = (token_log_probs * shift_resp).sum()  # scalar
 
-            # Backward to get gradients w.r.t. embeddings
-            response_ll.backward()
-
-            assert embed.grad is not None, "Embedding gradient is None"
+            # Gradient w.r.t. embeddings
+            if create_graph:
+                grad_embed = torch.autograd.grad(
+                    response_ll, embed, create_graph=True,
+                )[0]  # (B, L, d_model) — retains graph for second-order
+            else:
+                response_ll.backward()
+                assert embed.grad is not None, "Embedding gradient is None"
+                grad_embed = embed.grad  # (B, L, d_model)
 
             # Saliency = L2 norm of gradient at each position
-            saliency = embed.grad.norm(dim=-1)  # (B, L)
+            saliency = grad_embed.norm(dim=-1)  # (B, L)
 
             # Zero out response positions — only prompt saliency matters
             prompt_mask = (1 - labels_mask).float() * attention_mask.float()
             saliency = saliency * prompt_mask  # (B, L)
-            saliency = saliency.detach()
+
+            if not create_graph:
+                saliency = saliency.detach()
 
         finally:
-            # Restore parameter gradient states
-            for p, req in param_states:
-                p.requires_grad_(req)
+            # Restore parameter gradient states (only if we froze them)
+            if not create_graph:
+                for p, req in param_states:
+                    p.requires_grad_(req)
 
         if was_training:
             model.train()
@@ -131,16 +150,24 @@ class SaliencyComputer:
         self,
         saliency: torch.Tensor,    # (B, L)
         labels_mask: torch.Tensor,  # (B, L)
+        attention_mask: torch.Tensor | None = None,  # (B, L) — 1=valid, 0=padding
     ) -> torch.Tensor:
         """Convert saliency to a probability distribution over prompt positions.
 
         Applies softmax(saliency / temperature) over prompt positions only.
-        Response and padding positions get probability 0.
+        Response AND padding positions get probability 0.
+
+        Args:
+            attention_mask: If provided, padding positions (0) are also masked
+                out. Without this, padding positions would get exp(0)=1 in
+                softmax, leaking significant probability mass.
 
         Returns:
             dist: (B, L) — distribution summing to 1 over prompt positions.
         """
-        prompt_mask = (1 - labels_mask).float()  # (B, L) — 1=prompt
+        prompt_mask = (1 - labels_mask).float()  # (B, L) — 1=prompt/pad, 0=response
+        if attention_mask is not None:
+            prompt_mask = prompt_mask * attention_mask.float()  # 1=prompt only
         scores = saliency.float() / self.temperature  # (B, L)
 
         # Non-prompt positions → -inf so softmax gives 0

@@ -139,8 +139,8 @@ def main() -> None:
                 t_sal[j, :L_s] = s[:L_s].to(args.device)
 
         # Convert to distributions
-        t_dist = computer.to_distribution(t_sal, labels_mask)
-        s_dist = computer.to_distribution(s_sal, labels_mask)
+        t_dist = computer.to_distribution(t_sal, labels_mask, attention_mask=attn)
+        s_dist = computer.to_distribution(s_sal, labels_mask, attention_mask=attn)
 
         # JSD
         jsd = computer.divergence(t_dist, s_dist, labels_mask)  # (B,)
