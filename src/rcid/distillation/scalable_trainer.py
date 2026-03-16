@@ -180,21 +180,27 @@ class ScalableDistillationTrainer:
         self.sagd_tau_w: float = 1.0
 
         if self.use_sagd:
-            from rcid.distillation.saliency import SaliencyComputer
+            from rcid.distillation.saliency import (
+                SaliencyComputer,
+                SaliencyAlignmentLoss,
+            )
             self.saliency_computer = SaliencyComputer(
                 temperature=cfg.get("saliency_temperature", 2.0),
             )
+            self.saliency_loss_fn = SaliencyAlignmentLoss()
+            self.lambda_sal: float = cfg.get("lambda_sal", 0.5)
             sagd_path = cfg.get("teacher_saliency_path")
             assert sagd_path is not None, (
                 "SaGD requires config key 'teacher_saliency_path'"
             )
             cache = torch.load(sagd_path, map_location="cpu", weights_only=False)
             self.teacher_saliency_cache = cache["saliency"]
-            self.sagd_every = cfg.get("sagd_every_n_steps", 1)
+            self.sagd_every = cfg.get("sagd_every_n_steps", 5)
             self.sagd_tau_w = cfg.get("sagd_tau_w", 1.0)
             logger.info(
-                "SaGD: loaded %d teacher saliencies, every=%d, tau_w=%.2f",
-                len(self.teacher_saliency_cache), self.sagd_every, self.sagd_tau_w,
+                "SaGD: loaded %d teacher saliencies, every=%d, tau_w=%.2f, lambda_sal=%.2f",
+                len(self.teacher_saliency_cache), self.sagd_every,
+                self.sagd_tau_w, self.lambda_sal,
             )
 
         # ── Optimiser + AMP + WandB ──────────────────────────────────
@@ -336,9 +342,11 @@ class ScalableDistillationTrainer:
         if self.use_rcid:
             history["rcid_loss"] = []
         if self.use_sagd:
-            history["sagd_mean_jsd"] = []
-            history["sagd_max_weight"] = []
-            history["sagd_min_weight"] = []
+            history["sagd_mean_jsd"]     = []
+            history["sagd_max_weight"]   = []
+            history["sagd_min_weight"]   = []
+            history["sagd_sal_loss"]     = []
+            history["sagd_mean_cos_sim"] = []
 
         jsonl_path: Path | None = None
         if save_dir:
@@ -353,6 +361,7 @@ class ScalableDistillationTrainer:
         for epoch in range(self.epochs):
             ep_loss = ep_kl = ep_rcid = 0.0
             ep_sagd_jsd = ep_sagd_maxw = ep_sagd_minw = 0.0
+            ep_sagd_sal = ep_sagd_cos  = 0.0
             ep_adaptive: dict[str, float] = {k: 0.0 for k in self._adaptive_stat_keys}
             n_batches = 0
 
@@ -385,8 +394,10 @@ class ScalableDistillationTrainer:
                         rcid_loss_val = rcid_loss.item()
 
                     # ── SaGD reweighting ──────────────────────────────
-                    sagd_jsd_val = 0.0
-                    sagd_max_w = sagd_min_w = 0.0
+                    sagd_jsd_val      = 0.0
+                    sagd_max_w        = sagd_min_w = 0.0
+                    sagd_sal_loss_val = 0.0
+                    sagd_cos_sim_val  = 0.0
                     if self.use_sagd and step % self.sagd_every == 0:
                         indices = main_batch["index"]  # (B,)
                         labels_mask_b = main_batch["labels_mask"].to(self.device)
@@ -419,8 +430,15 @@ class ScalableDistillationTrainer:
                         per_sample_kl = self._compute_per_sample_kl(
                             t_logits, s_logits, mask)  # (B,)
                         kl_loss = (weights.detach() * per_sample_kl).mean()
-                        total_loss = kl_loss
 
+                        # Saliency alignment loss (first-order matching term)
+                        sal_loss, sal_stats = self.saliency_loss_fn(
+                            t_sal, s_sal, labels_mask_b,
+                        )
+                        total_loss = kl_loss + self.lambda_sal * sal_loss
+
+                        sagd_sal_loss_val = sal_loss.item()
+                        sagd_cos_sim_val  = sal_stats["mean_cos_sim"]
                         sagd_jsd_val = jsd.mean().item()
                         sagd_max_w = weights.max().item()
                         sagd_min_w = weights.min().item()
@@ -453,9 +471,11 @@ class ScalableDistillationTrainer:
                 ep_loss += loss_val
                 ep_kl += kl_val
                 ep_rcid += rcid_loss_val
-                ep_sagd_jsd += sagd_jsd_val
+                ep_sagd_jsd  += sagd_jsd_val
                 ep_sagd_maxw += sagd_max_w
                 ep_sagd_minw += sagd_min_w
+                ep_sagd_sal  += sagd_sal_loss_val
+                ep_sagd_cos  += sagd_cos_sim_val
                 n_batches += 1
 
                 if adaptive_stats is not None:
@@ -492,6 +512,8 @@ class ScalableDistillationTrainer:
                         rec["sagd_jsd"] = round(sagd_jsd_val, 6)
                         rec["sagd_max_w"] = round(sagd_max_w, 4)
                         rec["sagd_min_w"] = round(sagd_min_w, 4)
+                        rec["sagd_sal_loss"] = round(sagd_sal_loss_val, 6)
+                        rec["sagd_cos_sim"] = round(sagd_cos_sim_val, 4)
                     with open(jsonl_path, "a", encoding="utf-8") as fh:
                         fh.write(json.dumps(rec) + "\n")
 
@@ -508,6 +530,8 @@ class ScalableDistillationTrainer:
                         if self.use_sagd:
                             wd["sagd/jsd"] = sagd_jsd_val
                             wd["sagd/max_weight"] = sagd_max_w
+                            wd["sagd/sal_loss"] = sagd_sal_loss_val
+                            wd["sagd/cos_sim"] = sagd_cos_sim_val
                         wandb.log(wd)
                     except ImportError:
                         self.use_wandb = False
@@ -525,6 +549,8 @@ class ScalableDistillationTrainer:
                 history["sagd_mean_jsd"].append(ep_sagd_jsd / denom)
                 history["sagd_max_weight"].append(ep_sagd_maxw / denom)
                 history["sagd_min_weight"].append(ep_sagd_minw / denom)
+                history["sagd_sal_loss"].append(ep_sagd_sal / denom)
+                history["sagd_mean_cos_sim"].append(ep_sagd_cos / denom)
             if self.use_adaptive:
                 for k in self._adaptive_stat_keys:
                     history[k].append(ep_adaptive[k] / denom)
@@ -544,9 +570,10 @@ class ScalableDistillationTrainer:
                 )
             elif self.use_sagd:
                 logger.info(
-                    "Epoch %d/%d  loss=%.4f  kl=%.4f  jsd=%.4f  "
-                    "max_w=%.2f  lr=%.2e",
+                    "Epoch %d/%d  loss=%.4f  kl=%.4f  sal=%.4f  cos=%.3f  "
+                    "jsd=%.4f  max_w=%.2f  lr=%.2e",
                     epoch+1, self.epochs, avg_loss, avg_kl,
+                    ep_sagd_sal/denom, ep_sagd_cos/denom,
                     ep_sagd_jsd/denom, ep_sagd_maxw/denom,
                     self.optimizer.param_groups[0]["lr"],
                 )

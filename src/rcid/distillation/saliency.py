@@ -186,3 +186,48 @@ class SaliencyComputer:
         jsd = jsd.clamp(min=0.0, max=log2)
 
         return jsd  # (B,)
+
+
+class SaliencyAlignmentLoss(nn.Module):
+    """Cosine-distance alignment loss between raw teacher/student saliency vectors.
+
+    Computes:
+        L_sal = mean_i (1 - cosine_similarity(s_T^i, s_S^i))
+
+    This is the first-order matching term in the Sobolev/Taylor decomposition
+    of the distillation objective. Response positions are zeroed before
+    computing cosine similarity (they carry no prompt saliency information).
+
+    Args:
+        eps: Small constant to avoid division-by-zero for all-zero saliency
+             vectors (e.g. samples with no prompt tokens).
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(
+        self,
+        saliency_T: torch.Tensor,   # (B, L) raw teacher saliency
+        saliency_S: torch.Tensor,   # (B, L) raw student saliency
+        labels_mask: torch.Tensor,  # (B, L) 1=response, 0=prompt/pad
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute saliency alignment loss.
+
+        Returns:
+            loss:  scalar — mean cosine distance over the batch.
+            stats: dict with key 'mean_cos_sim' for logging.
+        """
+        prompt_mask = (1.0 - labels_mask.float())   # (B, L)
+        s_T = saliency_T.float() * prompt_mask      # (B, L)
+        s_S = saliency_S.float() * prompt_mask      # (B, L)
+
+        dot    = (s_T * s_S).sum(dim=-1)                       # (B,)
+        norm_T = s_T.norm(dim=-1).clamp(min=self.eps)          # (B,)
+        norm_S = s_S.norm(dim=-1).clamp(min=self.eps)          # (B,)
+        cos_sim = (dot / (norm_T * norm_S)).clamp(-1.0, 1.0)  # (B,)
+
+        loss = (1.0 - cos_sim).mean()
+        stats: dict[str, float] = {"mean_cos_sim": cos_sim.mean().item()}
+        return loss, stats

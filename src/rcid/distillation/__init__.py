@@ -6,5 +6,6 @@ __all__ = [
     "InformedFitNetsLoss",
     "RCIDLoss",
     "SaliencyComputer",
+    "SaliencyAlignmentLoss",
     "ScalableDistillationTrainer",
 ]

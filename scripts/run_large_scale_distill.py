@@ -241,7 +241,8 @@ def run_single(
     top_k_checkpoints: int = 10,
     # SaGD options
     teacher_saliency_path: str | None = None,
-    sagd_every_n_steps: int = 1,
+    lambda_sal: float = 0.5,
+    sagd_every_n_steps: int = 5,
     sagd_tau_w: float = 1.0,
     saliency_temperature: float = 2.0,
     # Eval
@@ -270,6 +271,7 @@ def run_single(
         "lambda_rcid": lambda_rcid, "rcid_every_n_steps": rcid_every_n_steps,
         "contrastive_pairs_path": contrastive_pairs_path,
         "teacher_saliency_path": teacher_saliency_path,
+        "lambda_sal": lambda_sal,
         "sagd_every_n_steps": sagd_every_n_steps,
         "sagd_tau_w": sagd_tau_w,
     }
@@ -343,6 +345,7 @@ def run_single(
         "klr_granularity": klr_granularity, "klr_beta": klr_beta,
         "klr_fixed_alpha": klr_fixed_alpha, "akl_mu": akl_mu,
         "teacher_saliency_path": teacher_saliency_path,
+        "lambda_sal": lambda_sal,
         "sagd_every_n_steps": sagd_every_n_steps,
         "sagd_tau_w": sagd_tau_w,
         "saliency_temperature": saliency_temperature,
@@ -445,8 +448,10 @@ def main() -> None:
     # SaGD options
     ap.add_argument("--teacher_saliency_path", type=str, default=None,
                     help="Path to precomputed teacher saliency .pt cache")
-    ap.add_argument("--sagd_every_n_steps", type=int, default=1,
-                    help="Apply SaGD reweighting every N steps (default: every step)")
+    ap.add_argument("--lambda_sal", type=float, default=0.5,
+                    help="Weight for saliency alignment loss (default: 0.5)")
+    ap.add_argument("--sagd_every_n_steps", type=int, default=5,
+                    help="Apply SaGD reweighting every N steps (default: 5)")
     ap.add_argument("--sagd_tau_w", type=float, default=1.0,
                     help="Temperature for SaGD weight softmax")
     ap.add_argument("--saliency_temperature", type=float, default=2.0,
@@ -488,6 +493,7 @@ def main() -> None:
         contrastive_task_types=args.contrastive_task_types,
         top_k_checkpoints=args.top_k_checkpoints,
         teacher_saliency_path=args.teacher_saliency_path,
+        lambda_sal=args.lambda_sal,
         sagd_every_n_steps=args.sagd_every_n_steps,
         sagd_tau_w=args.sagd_tau_w,
         saliency_temperature=args.saliency_temperature,
