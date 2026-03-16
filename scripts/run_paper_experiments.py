@@ -110,6 +110,10 @@ EXPERIMENT_CONFIGS: dict[str, dict[str, Any]] = {
         "saliency_temperature": 2.0,
         "description": "SaGD: saliency-guided sample reweighting (tau_w=1.0)",
     },
+    # Ablation: tau_w=100.0 makes softmax(jsd/tau_w) nearly uniform across
+    # all samples, so per-sample reweighting has almost no effect.
+    # This isolates the contribution of the saliency alignment loss
+    # (L_sal = cosine distance between teacher/student saliency vectors).
     "sagd_loss_only": {
         "method": "standard_kd_sagd",
         "teacher_saliency_path": "data/teacher_saliency_qwen3.pt",

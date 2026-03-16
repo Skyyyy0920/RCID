@@ -264,6 +264,33 @@ class ScalableDistillationTrainer:
             return self.rcid_loss_fn(t_res, s_res)
 
     # ------------------------------------------------------------------
+    # SaGD helpers
+    # ------------------------------------------------------------------
+
+    def _get_cached_teacher_saliency(
+        self,
+        indices: torch.Tensor,  # (B,)
+        max_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Look up precomputed teacher saliency and pad/truncate to max_len.
+
+        The cached saliency is trimmed to actual (non-padding) length during
+        precomputation. This method zero-pads shorter cached vectors and
+        truncates if cached length exceeds the current batch's max_len.
+
+        Returns:
+            t_sal: (B, max_len) teacher saliency on *device*.
+        """
+        B = len(indices)
+        t_sal = torch.zeros(B, max_len, device=device)
+        for j, idx_t in enumerate(indices):
+            s = self.teacher_saliency_cache[idx_t.item()]
+            L_s = min(len(s), max_len)
+            t_sal[j, :L_s] = s[:L_s].to(device)
+        return t_sal
+
+    # ------------------------------------------------------------------
     # SaGD per-sample KL
     # ------------------------------------------------------------------
 
@@ -405,11 +432,9 @@ class ScalableDistillationTrainer:
                         max_len = ids.shape[1]
 
                         # Look up precomputed teacher saliency
-                        t_sal = torch.zeros(B_cur, max_len, device=self.device)
-                        for j, idx_t in enumerate(indices):
-                            s = self.teacher_saliency_cache[idx_t.item()]
-                            L_s = min(len(s), max_len)
-                            t_sal[j, :L_s] = s[:L_s].to(self.device)
+                        t_sal = self._get_cached_teacher_saliency(
+                            indices, max_len, self.device,
+                        )  # (B, max_len)
 
                         # Compute student saliency on the fly
                         s_sal = self.saliency_computer.compute(
@@ -427,8 +452,11 @@ class ScalableDistillationTrainer:
                             jsd / self.sagd_tau_w, dim=0) * B_cur  # mean=1
 
                         # Per-sample KL with reweighting
+                        # logit[j] predicts token[j+1], so shift labels_mask
+                        shifted_resp = torch.zeros_like(labels_mask_b, dtype=torch.float)
+                        shifted_resp[:, :-1] = labels_mask_b[:, 1:].float()
                         per_sample_kl = self._compute_per_sample_kl(
-                            t_logits, s_logits, mask)  # (B,)
+                            t_logits, s_logits, shifted_resp)  # (B,)
                         kl_loss = (weights.detach() * per_sample_kl).mean()
 
                         # Saliency alignment loss (first-order matching term)

@@ -195,12 +195,15 @@ class SaliencyAlignmentLoss(nn.Module):
         L_sal = mean_i (1 - cosine_similarity(s_T^i, s_S^i))
 
     This is the first-order matching term in the Sobolev/Taylor decomposition
-    of the distillation objective. Response positions are zeroed before
-    computing cosine similarity (they carry no prompt saliency information).
+    of the distillation objective.
+
+    Note: saliency vectors from ``SaliencyComputer.compute()`` already have
+    response and padding positions zeroed out, so no additional masking is
+    needed here. Samples with no prompt tokens (all-zero saliency) are
+    excluded from the loss to avoid degenerate cosine similarity.
 
     Args:
-        eps: Small constant to avoid division-by-zero for all-zero saliency
-             vectors (e.g. samples with no prompt tokens).
+        eps: Small constant for ``F.cosine_similarity`` stability.
     """
 
     def __init__(self, eps: float = 1e-8) -> None:
@@ -216,18 +219,25 @@ class SaliencyAlignmentLoss(nn.Module):
         """Compute saliency alignment loss.
 
         Returns:
-            loss:  scalar — mean cosine distance over the batch.
+            loss:  scalar — mean cosine distance over valid samples.
             stats: dict with key 'mean_cos_sim' for logging.
         """
-        prompt_mask = (1.0 - labels_mask.float())   # (B, L)
-        s_T = saliency_T.float() * prompt_mask      # (B, L)
-        s_S = saliency_S.float() * prompt_mask      # (B, L)
+        s_T = saliency_T.float()  # (B, L) — already masked by compute()
+        s_S = saliency_S.float()  # (B, L)
 
-        dot    = (s_T * s_S).sum(dim=-1)                       # (B,)
-        norm_T = s_T.norm(dim=-1).clamp(min=self.eps)          # (B,)
-        norm_S = s_S.norm(dim=-1).clamp(min=self.eps)          # (B,)
-        cos_sim = (dot / (norm_T * norm_S)).clamp(-1.0, 1.0)  # (B,)
+        # Detect samples with at least one prompt position (non-zero saliency)
+        has_prompt = (s_T.abs().sum(dim=-1) > self.eps) & (
+            s_S.abs().sum(dim=-1) > self.eps
+        )  # (B,)
 
-        loss = (1.0 - cos_sim).mean()
-        stats: dict[str, float] = {"mean_cos_sim": cos_sim.mean().item()}
+        cos_sim = F.cosine_similarity(s_T, s_S, dim=-1, eps=self.eps)  # (B,)
+
+        if has_prompt.any():
+            loss = (1.0 - cos_sim[has_prompt]).mean()
+            mean_cos = cos_sim[has_prompt].mean().item()
+        else:
+            loss = torch.zeros(1, device=s_T.device, dtype=s_T.dtype).squeeze()
+            mean_cos = 0.0
+
+        stats: dict[str, float] = {"mean_cos_sim": mean_cos}
         return loss, stats
