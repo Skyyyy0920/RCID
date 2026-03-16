@@ -234,6 +234,7 @@ class InstructionDataset(Dataset):
             "input_ids": self.input_ids[idx],            # (seq_len,)
             "attention_mask": self.attention_masks[idx],  # (seq_len,)
             "labels_mask": self.labels_masks[idx],        # (seq_len,)
+            "index": torch.tensor(idx, dtype=torch.long),
         }
 
     @staticmethod
@@ -256,8 +257,11 @@ class InstructionDataset(Dataset):
             attention_mask[i, :L] = b["attention_mask"]
             labels_mask[i, :L] = b["labels_mask"]
 
+        index = torch.stack([b["index"] for b in batch])  # (batch,)
+
         return {
             "input_ids": input_ids,            # (batch, max_len)
             "attention_mask": attention_mask,   # (batch, max_len)
             "labels_mask": labels_mask,         # (batch, max_len)
+            "index": index,                    # (batch,)
         }

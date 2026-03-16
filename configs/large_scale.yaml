@@ -57,12 +57,34 @@ evaluation:
   max_new_tokens: 256
   eval_batch_size: 8
 
+# === RCID Regulariser ===
+rcid:
+  lambda_rcid: 0.1            # grid search: [0.01, 0.05, 0.1, 0.5, 1.0]
+  rcid_every_n_steps: 5       # compute RCID loss every N main-stream steps
+  top_k_checkpoints: 10       # causal checkpoints for RCID/InformedFitNets
+  contrastive_data_size: 5000 # target number of auto-generated pairs
+  contrastive_pairs_dir: data/contrastive_pairs/
+
+# === SaGD (Saliency-Guided KD) ===
+sagd:
+  sagd_every_n_steps: 1               # reweight every step (amortised cost)
+  sagd_tau_w: 1.0                      # softmax temperature for weight normalisation
+  saliency_temperature: 2.0            # saliency → distribution temperature
+  teacher_saliency_path: null           # set to data/teacher_saliency_qwen3.pt after precompute
+
 # Methods to compare
 methods:
+  # KL methods (single data stream)
   - standard_kd
   - reverse_kl
   - standard_kd_akl
   - standard_kd_klr
+  # RCID methods (dual data stream: KL + contrastive regulariser)
+  - standard_kd_rcid
+  - standard_kd_fitnets
+  - standard_kd_informed_fitnets
+  # SaGD methods (single data stream + precomputed saliency)
+  - standard_kd_sagd
 
 seeds: [42, 123, 456]
 

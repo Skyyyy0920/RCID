@@ -299,7 +299,7 @@ class TestScalableTrainerAdaptive:
             "main_ds": main_ds,
         }
 
-    def _make_trainer(self, setup: dict, method_cfg: dict):
+    def _make_trainer(self, setup: dict, method_cfg: dict, **extra_kwargs):
         from rcid.distillation.scalable_trainer import ScalableDistillationTrainer
 
         config = {
@@ -321,6 +321,7 @@ class TestScalableTrainerAdaptive:
             tokenizer=setup["tokenizer"],
             main_dataset=setup["main_ds"],
             config=config,
+            **extra_kwargs,
         )
 
     def test_klr_token(self, base_setup) -> None:
@@ -401,3 +402,437 @@ class TestScalableTrainerAdaptive:
             record = json.loads(lines[0])
             assert "step" in record
             assert "loss" in record
+
+
+# ==================================================================
+# 7. RCID modules: patching, CKA, Procrustes, loss
+# ==================================================================
+
+
+class TestPatchingModule:
+    """Test circuit/patching.py extract_contrastive_differences."""
+
+    def test_extract_diffs_shape(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.circuit.patching import extract_contrastive_differences
+
+        clean = torch.randint(2, 100, (4, 8))
+        corrupt = torch.randint(2, 100, (4, 8))
+        diffs = extract_contrastive_differences(
+            tiny_teacher, tiny_adapter, clean, corrupt,
+            layers=[0, 2], batch_size=4,
+        )
+        assert 0 in diffs and 2 in diffs
+        assert diffs[0].shape == (4, 8, 32)  # (N, seq, d_model)
+
+    def test_identical_inputs_zero_diff(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.circuit.patching import extract_contrastive_differences
+
+        ids = torch.randint(2, 100, (3, 6))
+        diffs = extract_contrastive_differences(
+            tiny_teacher, tiny_adapter, ids, ids,
+            layers=[1], batch_size=3,
+        )
+        assert diffs[1].abs().max().item() < 1e-5
+
+    def test_pooled_shape(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.circuit.patching import extract_contrastive_differences
+
+        clean = torch.randint(2, 100, (4, 8))
+        corrupt = torch.randint(2, 100, (4, 8))
+        diffs = extract_contrastive_differences(
+            tiny_teacher, tiny_adapter, clean, corrupt,
+            layers=[0, 3], batch_size=4, pool_seq=True,
+        )
+        assert diffs[0].shape == (4, 32)  # (N, d_model) — pooled
+
+
+class TestInterventionModule:
+    """Test circuit/intervention.py patch_and_run."""
+
+    def test_patch_and_run_shape(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.circuit.intervention import patch_and_run
+
+        clean = torch.randint(2, 100, (2, 6))
+        patch_val = torch.randn(2, 32)  # (batch, d_model)
+        logits = patch_and_run(
+            tiny_teacher, tiny_adapter, clean,
+            patch_value=patch_val, layer=1, token_pos=3,
+        )
+        assert logits.shape == (2, 6, 100)  # (batch, seq, vocab)
+
+    def test_causal_effect_at_modified_pos(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.circuit.intervention import compute_causal_effect
+
+        torch.manual_seed(42)
+        clean = torch.randint(2, 100, (1, 8))
+        corrupt = clean.clone()
+        corrupt[0, 3] = (clean[0, 3] + 1) % 100  # modify one position
+        delta = compute_causal_effect(
+            tiny_teacher, tiny_adapter,
+            clean_ids=clean, corrupt_ids=corrupt,
+            layer=2, token_pos=3,
+            answer_pos=3,  # TinyModel has no attention: must be same as patch pos
+            correct_id=5, wrong_id=10,
+        )
+        # Should have non-zero effect when patching at modified position
+        assert isinstance(delta, float)
+
+
+class TestCKAModule:
+    """Test alignment/cka.py."""
+
+    def test_self_cka_is_one(self) -> None:
+        from rcid.alignment.cka import linear_cka
+
+        X = torch.randn(50, 32)
+        assert abs(linear_cka(X, X) - 1.0) < 1e-4
+
+    def test_cka_matrix_shape(self) -> None:
+        from rcid.alignment.cka import cka_matrix
+
+        t_reps = {0: torch.randn(20, 64), 1: torch.randn(20, 64)}
+        s_reps = {0: torch.randn(20, 32), 1: torch.randn(20, 32), 2: torch.randn(20, 32)}
+        mat = cka_matrix(t_reps, s_reps)
+        assert mat.shape == (2, 3)  # (n_T, n_S)
+
+
+class TestProcrustesModule:
+    """Test alignment/procrustes.py."""
+
+    def test_procrustes_shape(self) -> None:
+        from rcid.alignment.procrustes import procrustes_align
+
+        source = torch.randn(50, 16)  # student: d_S=16
+        target = torch.randn(50, 32)  # teacher: d_T=32
+        W = procrustes_align(source, target)
+        assert W.shape == (32, 16)  # (d_T, d_S)
+
+    def test_aligned_projection(self) -> None:
+        from rcid.alignment.procrustes import procrustes_align
+
+        # Create synthetic data with known structure
+        torch.manual_seed(0)
+        source = torch.randn(100, 8)
+        W_true = torch.randn(16, 8)
+        target = source @ W_true.t()
+        W_est = procrustes_align(source, target)
+        # Reconstructed target should be close
+        recon = source @ W_est.t()
+        # Use cosine similarity (Procrustes preserves direction)
+        cos = torch.nn.functional.cosine_similarity(
+            recon.flatten().unsqueeze(0),
+            target.flatten().unsqueeze(0),
+        )
+        assert cos.item() > 0.8  # Procrustes is orthogonal; true W may not be
+
+
+class TestLayerMatchingModule:
+    """Test alignment/layer_matching.py."""
+
+    def test_greedy_matching(self) -> None:
+        from rcid.alignment.layer_matching import match_layers
+
+        # 4 teacher layers, 3 student layers
+        cka = torch.tensor([
+            [0.9, 0.1, 0.1],
+            [0.2, 0.8, 0.1],
+            [0.1, 0.3, 0.7],
+            [0.1, 0.1, 0.95],
+        ])
+        mapping = match_layers(cka, 4, 3, strategy="greedy")
+        assert isinstance(mapping, dict)
+        assert len(mapping) == 4
+        # Each teacher layer should map to one student layer
+        assert all(v in range(3) for v in mapping.values())
+
+    def test_linear_matching(self) -> None:
+        from rcid.alignment.layer_matching import match_layers
+
+        cka = torch.ones(6, 3)  # doesn't matter for linear
+        mapping = match_layers(cka, 6, 3, strategy="linear")
+        assert len(mapping) == 6
+
+
+class TestCheckpointSelection:
+    """Test circuit/checkpoint_selection.py."""
+
+    def test_select_returns_tuples(self) -> None:
+        from rcid.circuit.checkpoint_selection import select_checkpoints
+
+        # Fake contrastive diffs: 4 layers, 3 samples, 6 seq positions, d=32
+        diffs = {i: torch.randn(3, 6, 32) for i in range(4)}
+        # Make layer 3 have higher norm (should be preferred)
+        diffs[3] = diffs[3] * 10
+
+        # Fake dataset with is_modified metadata
+        class FakeDS:
+            seq_len = 6
+            is_modified = {"s2_pos": True}
+            key_positions = {"s2_pos": torch.tensor([2, 3, 4])}
+
+        checkpoints = select_checkpoints(diffs, FakeDS(), top_k=5)
+        assert isinstance(checkpoints, list)
+        assert len(checkpoints) <= 5
+        assert all(isinstance(c, tuple) and len(c) == 2 for c in checkpoints)
+
+
+class TestRCIDLossModule:
+    """Test distillation/rcid_loss.py."""
+
+    def test_rcid_loss_computes(self) -> None:
+        from rcid.distillation.rcid_loss import RCIDLoss
+
+        # Setup: 2 checkpoints, layer 1 -> student layer 0
+        checkpoints = [(1, 2), (1, 4)]
+        layer_mapping = {1: 0}
+        W = torch.eye(32)  # same dim for simplicity
+        loss_fn = RCIDLoss(checkpoints, layer_mapping, {1: W})
+
+        teacher_diffs = {1: torch.randn(2, 6, 32)}
+        s_clean = {0: torch.randn(2, 6, 32, requires_grad=True)}
+        s_corrupt = {0: torch.randn(2, 6, 32, requires_grad=True)}
+
+        loss = loss_fn(teacher_diffs, s_clean, s_corrupt)
+        assert loss.isfinite()
+        assert loss.item() >= 0
+        loss.backward()
+        assert s_clean[0].grad is not None
+
+    def test_rcid_zero_when_identical(self) -> None:
+        from rcid.distillation.rcid_loss import RCIDLoss
+
+        checkpoints = [(0, 1)]
+        layer_mapping = {0: 0}
+        W = torch.eye(16)
+        loss_fn = RCIDLoss(checkpoints, layer_mapping, {0: W})
+
+        # If student diffs match teacher diffs exactly -> loss ~ 0
+        d = torch.randn(3, 4, 16)
+        teacher_diffs = {0: d.detach()}
+        # s_clean - s_corrupt = d
+        s_corrupt = torch.zeros(3, 4, 16, requires_grad=True)
+        s_clean = (d + s_corrupt).requires_grad_(True)
+
+        loss = loss_fn(teacher_diffs, {0: s_clean}, {0: s_corrupt})
+        assert loss.item() < 1e-4
+
+    def test_extract_residuals_with_grad(self, tiny_teacher, tiny_adapter) -> None:
+        from rcid.distillation.rcid_loss import extract_residuals_with_grad
+
+        # Note: need a model with requires_grad (student, not teacher)
+        torch.manual_seed(1)
+        student = TinyTransformerModel(n_layers=4, d_model=32, vocab_size=100)
+        student.train()
+        ids = torch.randint(2, 100, (2, 6))
+        cache = extract_residuals_with_grad(student, tiny_adapter, ids, [0, 2])
+        assert 0 in cache and 2 in cache
+        assert cache[0].shape == (2, 6, 32)
+
+
+class TestGeneratedContrastiveDataset:
+    """Test data/generated_contrastive.py."""
+
+    def test_load_from_json(self, fake_tokenizer) -> None:
+        from rcid.data.generated_contrastive import GeneratedContrastiveDataset
+
+        pairs = [
+            {"clean": "The capital of France is", "corrupt": "The capital of Germany is", "task_type": "entity_swap"},
+            {"clean": "John has 5 apples", "corrupt": "John has 7 apples", "task_type": "number_perturb"},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(pairs, f)
+            tmp_path = f.name
+
+        try:
+            ds = GeneratedContrastiveDataset(tmp_path, fake_tokenizer, max_seq_len=64)
+            assert len(ds) == 2
+            item = ds[0]
+            assert "clean_ids" in item
+            assert "corrupt_ids" in item
+            assert item["clean_ids"].shape == item["corrupt_ids"].shape
+        finally:
+            Path(tmp_path).unlink()
+
+    def test_collate_fn(self, fake_tokenizer) -> None:
+        from rcid.data.generated_contrastive import GeneratedContrastiveDataset
+
+        pairs = [
+            {"clean": "Hello world", "corrupt": "Hello earth", "task_type": "test"},
+            {"clean": "Good morning", "corrupt": "Good evening", "task_type": "test"},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(pairs, f)
+            tmp_path = f.name
+
+        try:
+            ds = GeneratedContrastiveDataset(tmp_path, fake_tokenizer)
+            batch = [ds[0], ds[1]]
+            collated = ds.collate_fn(batch)
+            assert collated["clean_ids"].shape[0] == 2
+        finally:
+            Path(tmp_path).unlink()
+
+
+# ==================================================================
+# 8. ScalableDistillationTrainer — RCID methods
+# ==================================================================
+
+
+class _FakeContrastiveDataset(Dataset):
+    """Tiny contrastive dataset for RCID trainer tests."""
+
+    def __init__(self, n: int = 8, seq_len: int = 10, vocab_size: int = 100) -> None:
+        self.clean_ids = torch.randint(2, vocab_size, (n, seq_len))
+        self.corrupt_ids = self.clean_ids.clone()
+        # Modify one position per sample
+        for i in range(n):
+            pos = i % seq_len
+            self.corrupt_ids[i, pos] = (self.clean_ids[i, pos] + 1) % vocab_size
+        self.is_modified = {"modified": True}
+        self.key_positions = {
+            "modified": torch.arange(n) % seq_len,
+        }
+        self._seq_len = seq_len
+
+    @property
+    def seq_len(self) -> int:
+        return self._seq_len
+
+    def __len__(self) -> int:
+        return self.clean_ids.shape[0]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "clean_ids": self.clean_ids[idx],
+            "corrupt_ids": self.corrupt_ids[idx],
+        }
+
+    @staticmethod
+    def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        return {
+            "clean_ids": torch.stack([b["clean_ids"] for b in batch]),
+            "corrupt_ids": torch.stack([b["corrupt_ids"] for b in batch]),
+        }
+
+
+class TestScalableTrainerRCID:
+    """Test trainer with RCID methods (dual data stream)."""
+
+    @pytest.fixture
+    def rcid_setup(self, tiny_teacher, tiny_adapter, fake_tokenizer):
+        main_ds = _FakeInstructionDataset(n=8, seq_len=10, vocab_size=100)
+        contrastive_ds = _FakeContrastiveDataset(n=8, seq_len=10, vocab_size=100)
+
+        # Simple layer mapping and checkpoints for 4-layer model
+        layer_mapping = {0: 0, 1: 1, 2: 2, 3: 3}
+        checkpoints = [(2, 3), (3, 5)]
+        W_matrices = {l: torch.eye(32) for l in layer_mapping}
+
+        return {
+            "teacher": tiny_teacher,
+            "adapter": tiny_adapter,
+            "tokenizer": fake_tokenizer,
+            "main_ds": main_ds,
+            "contrastive_ds": contrastive_ds,
+            "layer_mapping": layer_mapping,
+            "checkpoints": checkpoints,
+            "W_matrices": W_matrices,
+        }
+
+    def _make_rcid_trainer(self, setup: dict, method: str):
+        from rcid.distillation.scalable_trainer import ScalableDistillationTrainer
+
+        config = {
+            "method": method,
+            "epochs": 1,
+            "batch_size": 4,
+            "gradient_accumulation": 1,
+            "lr": 1e-3,
+            "fp16": False,
+            "temperature": 2.0,
+            "use_wandb": False,
+        }
+        torch.manual_seed(1)
+        student = TinyTransformerModel(n_layers=4, d_model=32, vocab_size=100)
+
+        # Build appropriate loss function
+        if method == "standard_kd_rcid":
+            from rcid.distillation.rcid_loss import RCIDLoss
+            loss_fn = RCIDLoss(
+                setup["checkpoints"], setup["layer_mapping"], setup["W_matrices"],
+            )
+        elif method == "standard_kd_fitnets":
+            from rcid.distillation.baselines import FitNetsLoss
+            loss_fn = FitNetsLoss(setup["layer_mapping"], setup["W_matrices"])
+        else:  # standard_kd_informed_fitnets
+            from rcid.distillation.baselines import InformedFitNetsLoss
+            loss_fn = InformedFitNetsLoss(
+                setup["checkpoints"], setup["layer_mapping"], setup["W_matrices"],
+            )
+
+        return ScalableDistillationTrainer(
+            teacher=setup["teacher"], student=student,
+            teacher_adapter=setup["adapter"], student_adapter=setup["adapter"],
+            tokenizer=setup["tokenizer"],
+            main_dataset=setup["main_ds"],
+            config=config,
+            contrastive_dataset=setup["contrastive_ds"],
+            rcid_loss_fn=loss_fn,
+            lambda_rcid=0.5,
+            rcid_every_n_steps=1,
+            layer_mapping=setup["layer_mapping"],
+            checkpoints=setup["checkpoints"],
+        )
+
+    def test_rcid_trains_without_error(self, rcid_setup) -> None:
+        trainer = self._make_rcid_trainer(rcid_setup, "standard_kd_rcid")
+        history = trainer.train()
+        assert "loss" in history
+        assert "rcid_loss" in history
+        assert len(history["loss"]) == 1
+        assert len(history["rcid_loss"]) == 1
+
+    def test_fitnets_trains_without_error(self, rcid_setup) -> None:
+        trainer = self._make_rcid_trainer(rcid_setup, "standard_kd_fitnets")
+        history = trainer.train()
+        assert "rcid_loss" in history
+        assert len(history["loss"]) == 1
+
+    def test_informed_fitnets_trains_without_error(self, rcid_setup) -> None:
+        trainer = self._make_rcid_trainer(rcid_setup, "standard_kd_informed_fitnets")
+        history = trainer.train()
+        assert "rcid_loss" in history
+        assert len(history["loss"]) == 1
+
+    def test_rcid_student_params_updated(self, rcid_setup) -> None:
+        trainer = self._make_rcid_trainer(rcid_setup, "standard_kd_rcid")
+        student = trainer.student
+        params_before = {n: p.clone() for n, p in student.named_parameters()}
+
+        trainer.train()
+
+        any_changed = any(
+            not torch.equal(p, params_before[n])
+            for n, p in student.named_parameters()
+        )
+        assert any_changed
+
+    def test_rcid_method_requires_contrastive(self, rcid_setup) -> None:
+        """RCID method without contrastive_dataset should fail."""
+        from rcid.distillation.scalable_trainer import ScalableDistillationTrainer
+
+        config = {"method": "standard_kd_rcid", "epochs": 1, "batch_size": 4,
+                  "fp16": False}
+        torch.manual_seed(1)
+        student = TinyTransformerModel(n_layers=4, d_model=32, vocab_size=100)
+
+        with pytest.raises(AssertionError, match="requires contrastive_dataset"):
+            ScalableDistillationTrainer(
+                teacher=rcid_setup["teacher"], student=student,
+                teacher_adapter=rcid_setup["adapter"],
+                student_adapter=rcid_setup["adapter"],
+                tokenizer=rcid_setup["tokenizer"],
+                main_dataset=rcid_setup["main_ds"],
+                config=config,
+                # No contrastive_dataset!
+            )

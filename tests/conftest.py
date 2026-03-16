@@ -43,9 +43,17 @@ class TinyTransformerModel(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(
-        self, input_ids: torch.Tensor, **kwargs: object
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
     ) -> SimpleNamespace:
-        h = self.model.embed_tokens(input_ids)  # (batch, seq, d_model)
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        elif input_ids is not None:
+            h = self.model.embed_tokens(input_ids)  # (batch, seq, d_model)
+        else:
+            raise ValueError("Either input_ids or inputs_embeds required")
         for layer in self.model.layers:
             h = layer(h)[0]
         logits = self.lm_head(h)  # (batch, seq, vocab)

@@ -4,6 +4,9 @@ Generates responses from a model and computes ROUGE-L scores against
 ground-truth references.  Used to evaluate distilled students on the
 Dolly-15K test split.
 
+Handles Qwen3 thinking-mode output (``<think>...</think>`` blocks) by
+stripping them before scoring.
+
 Usage::
 
     from rcid.eval.rouge_eval import evaluate_rouge, save_generations
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +32,17 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel, PreTrainedTokenizer
 
 logger = logging.getLogger(__name__)
+
+# Regex to strip Qwen3 thinking blocks
+_THINK_CLOSED = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
+_THINK_UNCLOSED = re.compile(r"<think>.*$", flags=re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks and unclosed thinking tails."""
+    text = _THINK_CLOSED.sub("", text)
+    text = _THINK_UNCLOSED.sub("", text)
+    return text.strip()
 
 
 @torch.no_grad()
@@ -94,12 +109,36 @@ def evaluate_rouge(
 
         prompt_len = inputs["input_ids"].shape[1]
         for output in outputs:
-            text = tokenizer.decode(
-                output[prompt_len:], skip_special_tokens=True,
-            )
-            generations.append(text.strip())
+            generated_ids = output[prompt_len:]
+
+            # Decode raw first (keep special tokens to handle <think>)
+            raw_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
+
+            # Strip Qwen3 thinking blocks, then clean special tokens
+            text = _strip_thinking(raw_text)
+            for tok in tokenizer.all_special_tokens:
+                text = text.replace(tok, "")
+            text = text.strip()
+
+            # Fallback: if stripping produced nothing, try plain decode
+            if not text:
+                text = tokenizer.decode(
+                    generated_ids, skip_special_tokens=True,
+                ).strip()
+
+            generations.append(text)
 
     tokenizer.padding_side = old_padding_side
+
+    # Diagnostic: count empty generations
+    n_empty = sum(1 for g in generations if not g)
+    if n_empty > 0:
+        logger.warning(
+            "Empty generations: %d / %d (%.1f%%). "
+            "Possible cause: model uses thinking mode or generates EOS "
+            "immediately. Consider increasing max_new_tokens.",
+            n_empty, len(generations), 100 * n_empty / max(len(generations), 1),
+        )
 
     # Compute ROUGE-L scores
     scores_f: list[float] = []
@@ -116,6 +155,7 @@ def evaluate_rouge(
         "rouge_l_p": sum(scores_p) / max(len(scores_p), 1),
         "rouge_l_r": sum(scores_r) / max(len(scores_r), 1),
         "num_samples": len(eval_prompts),
+        "num_empty_generations": n_empty,
         "generations": generations,
         "per_sample_rouge_l_f": scores_f,
     }

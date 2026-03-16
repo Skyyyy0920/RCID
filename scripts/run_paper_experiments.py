@@ -101,6 +101,31 @@ EXPERIMENT_CONFIGS: dict[str, dict[str, Any]] = {
         "klr_beta": 0.999,
         "description": "KL-Ratio batch, beta=0.999",
     },
+    # ── SaGD (Saliency-Guided KD) ────────────────────────────────────
+    "sagd": {
+        "method": "standard_kd_sagd",
+        "teacher_saliency_path": "data/teacher_saliency_qwen3.pt",
+        "sagd_every_n_steps": 1,
+        "sagd_tau_w": 1.0,
+        "saliency_temperature": 2.0,
+        "description": "SaGD: saliency-guided sample reweighting (tau_w=1.0)",
+    },
+    "sagd_loss_only": {
+        "method": "standard_kd_sagd",
+        "teacher_saliency_path": "data/teacher_saliency_qwen3.pt",
+        "sagd_every_n_steps": 1,
+        "sagd_tau_w": 100.0,
+        "saliency_temperature": 2.0,
+        "description": "SaGD ablation: near-uniform weights (tau_w=100)",
+    },
+    "sagd_reweight_only": {
+        "method": "standard_kd_sagd",
+        "teacher_saliency_path": "data/teacher_saliency_qwen3.pt",
+        "sagd_every_n_steps": 1,
+        "sagd_tau_w": 0.1,
+        "saliency_temperature": 2.0,
+        "description": "SaGD ablation: aggressive reweighting (tau_w=0.1)",
+    },
 }
 
 # Shared training hyper-parameters (all experiments must match)
